@@ -10,10 +10,11 @@ import pandas as pd
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_squared_error
-from skorch.callbacks import EarlyStopping
+from skorch.callbacks import EarlyStopping, ProgressBar
 import matplotlib.pyplot as plt
 
 import pickle
+import resource
 
 # Define the LSTM model using PyTorch
 class LSTMRegressor(nn.Module):
@@ -36,11 +37,26 @@ early_stopping = EarlyStopping(
 )
 
 if __name__ == "__main__":
+    # Try to set memory limit to encourage swap usage (optional)
+    try:
+        current_limits = resource.getrlimit(resource.RLIMIT_AS)
+        print(f"Current memory limits: soft={current_limits[0] // (1024**3)}GB, hard={current_limits[1] // (1024**3)}GB")
+        # Only set if current soft limit is higher than 16GB
+        if current_limits[0] > 16 * 1024 * 1024 * 1024:
+            soft_limit = 12 * 1024 * 1024 * 1024  # 12GB in bytes
+            hard_limit = current_limits[1]  # Keep current hard limit
+            resource.setrlimit(resource.RLIMIT_AS, (soft_limit, hard_limit))
+            print(f"Memory limit set to {soft_limit // (1024**3)}GB soft (to encourage swap usage)")
+        else:
+            print("Memory limit not changed (already reasonable)")
+    except ValueError as e:
+        print(f"Could not set memory limit: {e}. System will manage memory automatically.")
+
     # Check if CUDA is available
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Training on device {device}.")
     print("Loading data...")
-    df = pd.read_csv('full_btc_usdt_data_feature_engineered.csv')
+    df = pd.read_csv('btc_usdt_training_data/full_btc_usdt_data_feature_engineered.csv')
     df = df.dropna()
 
     print("Removing constant columns...")
@@ -101,7 +117,7 @@ if __name__ == "__main__":
 
     print("Searching for optimal hyperparameters...")
     # Create the RandomizedSearchCV object
-    random_search = RandomizedSearchCV(net, params, n_iter=20, cv=3, scoring='neg_mean_squared_error', n_jobs=2, random_state=42)
+    random_search = RandomizedSearchCV(net, params, n_iter=20, cv=3, scoring='neg_mean_squared_error', n_jobs=2, random_state=42, verbose=2)
 
     print("Training model...")
     # Fit the model

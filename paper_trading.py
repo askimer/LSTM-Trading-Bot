@@ -26,7 +26,7 @@ best_model = best_model.to(device)
 best_model.eval()
 
 # load completely new test data
-df = pd.read_csv('./paper_trade_data_heaven/full_btc_usdt_data_feature_engineered.csv')
+df = pd.read_csv('./paper_trade_data/full_btc_usdt_data_feature_engineered.csv')
 df = df.dropna()
 
 # remove constant columns

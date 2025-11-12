@@ -42,3 +42,6 @@ typing_extensions==4.13.2
 tzdata==2025.2
 url-normalize==2.2.0
 urllib3==2.4.0
+stable-baselines3==2.3.2
+gym==0.26.2
+tensorboard==2.16.2
