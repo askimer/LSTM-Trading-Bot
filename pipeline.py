@@ -39,6 +39,9 @@ def run_script(script_name):
         print(f"Error running {script_name}:")
         print(result.stderr)
         sys.exit(1)
+    # Print the output of the script
+    if result.stdout:
+        print(result.stdout.strip())
     print(f"{script_name} completed successfully.")
 
 def rename_data_folder():
