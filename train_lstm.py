@@ -64,16 +64,21 @@ if __name__ == "__main__":
     non_constant_columns = std_dev[std_dev != 0].index.tolist()
     df = df[non_constant_columns]
 
-    X = df.drop('Close', axis=1).values
-    y = df['Close'].values.reshape(-1, 1)
+    X = df.drop('close', axis=1).values
+    y = df['close'].values.reshape(-1, 1)
 
     print("Scaling data...")
-    scaler = StandardScaler()
-    X = scaler.fit_transform(X)
+    scaler_X = StandardScaler()
+    X = scaler_X.fit_transform(X)
 
-    # pickle the scaler
-    with open('scaler.pkl', 'wb') as f:
-        pickle.dump(scaler, f)
+    scaler_y = StandardScaler()
+    y = scaler_y.fit_transform(y)
+
+    # pickle the scalers
+    with open('scaler_X.pkl', 'wb') as f:
+        pickle.dump(scaler_X, f)
+    with open('scaler_y.pkl', 'wb') as f:
+        pickle.dump(scaler_y, f)
 
     print("Splitting data into train and test sets...")
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
