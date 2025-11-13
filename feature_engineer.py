@@ -1,6 +1,7 @@
 import pandas as pd
 import os
 import ta
+import talib
 from enum import Enum
 
 def calculate_ema(data, window):
@@ -125,8 +126,7 @@ def calculate_WCLPRICE(data, _):
     high = data['High']
     low = data['Low']
     close = data['Close']
-    wclprice_indicator = ta.others.WeightedClosePrice(high, low, close)
-    return wclprice_indicator.weighted_close_price()
+    return (high + low + 2 * close) / 4
 
 def calculate_HT_DCPERIOD(data, _):
     close = data['Close']
@@ -207,8 +207,7 @@ indicators = {
     # Price Transform
     'WCLPRICE': (calculate_WCLPRICE, ()),
 
-    # Cycle Indicators
-    'HT_DCPERIOD': (calculate_HT_DCPERIOD, ()),
+
 
     # Statistical Indicators
     'VAR_15': (calculate_VAR, (TimeWindows.super_short.value)),
