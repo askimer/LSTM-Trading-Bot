@@ -1,6 +1,6 @@
 import pandas as pd
 import os
-import talib
+import ta
 from enum import Enum
 
 def calculate_ema(data, window):
@@ -37,28 +37,30 @@ def calculate_macd(data, window_slow=26, window_fast=12, signal=9):
 def calculate_OBV(data):
     close = data['Close']
     volume = data['Volume']
-    obv = talib.OBV(close, volume)
-    return obv
+    obv_indicator = ta.volume.OnBalanceVolumeIndicator(close, volume)
+    return obv_indicator.on_balance_volume()
 
 def calculate_ATR(data, window):
     high = data['High']
     low = data['Low']
     close = data['Close']
-    atr = talib.ATR(high, low, close, timeperiod=window)
-    return atr
+    atr_indicator = ta.volatility.AverageTrueRange(high, low, close, window=window)
+    return atr_indicator.average_true_range()
 
 def calculate_ADX(data, window):
     high = data['High']
     low = data['Low']
     close = data['Close']
-    adx = talib.ADX(high, low, close, timeperiod=window)
-    return adx
+    adx_indicator = ta.trend.ADXIndicator(high, low, close, window=window)
+    return adx_indicator.adx()
 
 def calculate_stochastic(data):
     high = data['High']
     low = data['Low']
     close = data['Close']
-    slowk, slowd = talib.STOCH(high, low, close)
+    stoch_indicator = ta.momentum.StochasticOscillator(high, low, close)
+    slowk = stoch_indicator.stoch()
+    slowd = stoch_indicator.stoch_signal()
     return slowk, slowd
 
 def calculate_AD(data, _):
@@ -66,8 +68,8 @@ def calculate_AD(data, _):
     low = data['Low']
     close = data['Close']
     volume = data['Volume']
-    ad = talib.AD(high, low, close, volume)
-    return ad
+    ad_indicator = ta.volume.AccDistIndexIndicator(high, low, close, volume)
+    return ad_indicator.acc_dist_index()
 
 def calculate_StdDev(data, window):
     closed = data['Close']
@@ -75,52 +77,61 @@ def calculate_StdDev(data, window):
 
 def calculate_LinearReg(data, window):
     closed = data['Close']
-    return talib.LINEARREG(closed, timeperiod=window)
+    linreg_indicator = ta.trend.LinearRegression(close=closed, window=window)
+    return linreg_indicator.linear_regression()
 
 def calculate_MFI(data, window):
     high = data['High']
     low = data['Low']
     close = data['Close']
     volume = data['Volume']
-    return talib.MFI(high, low, close, volume, timeperiod=window)
+    mfi_indicator = ta.volume.MFIIndicator(high, low, close, volume, window=window)
+    return mfi_indicator.money_flow_index()
 
 def calculate_MOM(data, window):
     closed = data['Close']
-    return talib.MOM(closed, timeperiod=window)
+    mom_indicator = ta.momentum.ROCIndicator(close=closed, window=window)
+    return mom_indicator.roc()
 
 def calculate_ULTOSC(data, _):
     high = data['High']
     low = data['Low']
     close = data['Close']
-    return talib.ULTOSC(high, low, close)
+    ultosc_indicator = ta.momentum.UltimateOscillator(high, low, close)
+    return ultosc_indicator.ultimate_oscillator()
 
 def calculate_WillR(data, window):
     high = data['High']
     low = data['Low']
     close = data['Close']
-    return talib.WILLR(high, low, close, timeperiod=window)
+    willr_indicator = ta.momentum.WilliamsRIndicator(high, low, close, lbp=window)
+    return willr_indicator.williams_r()
 
 def calculate_NATR(data, window):
     high = data['High']
     low = data['Low']
     close = data['Close']
-    return talib.NATR(high, low, close, timeperiod=window)
+    natr_indicator = ta.volatility.NATR(high, low, close, window=window)
+    return natr_indicator.natr()
 
 def calculate_TRANGE(data, _):
     high = data['High']
     low = data['Low']
     close = data['Close']
-    return talib.TRANGE(high, low, close)
+    trange_indicator = ta.volatility.TrueRange(high, low, close)
+    return trange_indicator.true_range()
 
 def calculate_WCLPRICE(data, _):
     high = data['High']
     low = data['Low']
     close = data['Close']
-    return talib.WCLPRICE(high, low, close)
+    wclprice_indicator = ta.others.WeightedClosePrice(high, low, close)
+    return wclprice_indicator.weighted_close_price()
 
 def calculate_HT_DCPERIOD(data, _):
     close = data['Close']
-    return talib.HT_DCPERIOD(close)
+    ht_dcperiod_indicator = ta.cycle.HilbertTransformDominantCyclePeriod(close)
+    return ht_dcperiod_indicator.hilbert_transform_dominant_cycle_period()
 
 def calculate_BETA(data, window):
     high = data['High']
@@ -129,7 +140,7 @@ def calculate_BETA(data, window):
 
 def calculate_VAR(data, window):
     close = data['Close']
-    return talib.VAR(close, timeperiod=window)
+    return close.rolling(window=window).var()
 
 def process_chunk(chunk, overlap, indicators, window_size):
     chunk_combined = pd.concat([overlap, chunk])
@@ -210,12 +221,26 @@ indicators = {
     'MFI_300': (calculate_MFI, (TimeWindows.long.value)),
 }
 
-output_file = './btc_usdt_data/full_btc_usdt_data_feature_engineered.csv'
+output_file = './btc_usdt_training_data/full_btc_usdt_data_feature_engineered.csv'
+
+dtypes = {
+    'Open time': 'int64',
+    'Open': 'float64',
+    'High': 'float64',
+    'Low': 'float64',
+    'Close': 'float64',
+    'Volume': 'float64',
+    'Quote asset volume': 'float64',
+    'Number of trades': 'int64',
+    'Taker buy base asset volume': 'float64',
+    'Taker buy quote asset volume': 'float64'
+}
 
 i=0
-for chunk in pd.read_csv('./btc_usdt_data/full_btc_usdt_data_cleaned.csv', chunksize=chunk_size):
+for chunk in pd.read_csv('./btc_usdt_data/full_btc_usdt_data_cleaned.csv', chunksize=chunk_size, dtype=dtypes, low_memory=False):
     processed_chunk, overlap = process_chunk(chunk, overlap, indicators, window_size)
 
+    processed_chunk = processed_chunk.rename(columns={'Close': 'close'})
     processed_chunk.to_csv(output_file, mode='a', header=not os.path.exists(output_file), index=False)
     i+=len(processed_chunk)
     print(f'Processed chunk, {i} rows saved to {output_file}')

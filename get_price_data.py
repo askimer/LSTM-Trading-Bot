@@ -11,7 +11,7 @@ def unzip_file(zip_path, extract_to):
 def append_to_csv(data, csv_file, write_header=False):
     data.to_csv(csv_file, mode='a', header=write_header, index=False)
 
-def download_and_process_data(start_date, end_date, symbol='BTCUSDT', interval='1s'):
+def download_and_process_data(start_date, end_date, symbol='BTCUSDT', interval='1m'):
     output_csv = 'btc_usdt_data/full_btc_usdt_data.csv'
     # set the headers to Open time, Open, High, Low, Close, Volumne, Close time, Quote asset volume, Number of trades, Taker buy base asset volume, Taker buy quote asset volume, Ignore
     headers = ['Open time', 'Open', 'High', 'Low', 'Close', 'Volume', 'Close time', 'Quote asset volume', 'Number of trades', 'Taker buy base asset volume', 'Taker buy quote asset volume', 'Ignore']
@@ -35,7 +35,7 @@ def download_and_process_data(start_date, end_date, symbol='BTCUSDT', interval='
             unzipped_file_path = f'btc_usdt_data/{symbol}-{interval}-{date_str}.csv'
 
             # Read and append the data to the CSV
-            daily_data = pd.read_csv(unzipped_file_path)
+            daily_data = pd.read_csv(unzipped_file_path, header=None, names=headers)
             append_to_csv(daily_data, output_csv, write_header=False)
 
             # Delete the unzipped file
@@ -53,6 +53,9 @@ def download_and_process_data(start_date, end_date, symbol='BTCUSDT', interval='
 if not os.path.exists('btc_usdt_data'):
     os.makedirs('btc_usdt_data')
 
-start_date = datetime(2025, 6, 30)
+if not os.path.exists('btc_usdt_training_data'):
+    os.makedirs('btc_usdt_training_data')
+
+start_date = datetime(2024, 1, 1)
 end_date = datetime.now()
 download_and_process_data(start_date, end_date)

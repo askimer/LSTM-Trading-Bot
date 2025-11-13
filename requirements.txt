@@ -45,3 +45,4 @@ urllib3==2.4.0
 stable-baselines3==2.3.2
 gym==0.26.2
 tensorboard==2.16.2
+TA-Lib==0.4.28
