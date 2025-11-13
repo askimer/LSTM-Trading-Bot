@@ -45,6 +45,4 @@ urllib3==2.4.0
 stable-baselines3==2.3.2
 gym==0.26.2
 tensorboard==2.16.2
-ccxt==4.3.74
-websocket-client==1.7.0
-python-dotenv==1.0.0
+TA-Lib==0.4.28
