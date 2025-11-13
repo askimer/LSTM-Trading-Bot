@@ -220,7 +220,7 @@ indicators = {
     'MFI_300': (calculate_MFI, (TimeWindows.long.value)),
 }
 
-output_file = './btc_usdt_training_data/full_btc_usdt_data_feature_engineered.csv'
+output_file = './btc_usdt_data/full_btc_usdt_data_feature_engineered.csv'
 
 dtypes = {
     'Open time': 'int64',

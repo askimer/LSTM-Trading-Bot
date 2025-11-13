@@ -183,7 +183,8 @@ def main(start_from=1):
         1: ("Data Acquisition", lambda: (
             run_script('get_price_data.py'),
             run_script('clean_data.py'),
-            run_script('feature_engineer.py')
+            run_script('feature_engineer.py'),
+            rename_data_folder()
         )),
         2: ("Prepare Data Folders", lambda: (
             rename_data_folder(),
