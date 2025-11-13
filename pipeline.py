@@ -2,7 +2,7 @@
 """
 Pipeline script for sequential execution of the Algorithmic Trading Bot.
 Supports both LSTM (supervised) and RL (reinforcement learning) approaches.
-This script automates the entire process from data acquisition to paper trading.
+This script automates the entire process from data acquisition to live virtual trading.
 
 __Этапы:__
 
@@ -12,6 +12,7 @@ __Этапы:__
 4. Train Model (обучение LSTM или RL модели)
 5. Tune Trading Strategy (настройка стратегии)
 6. Paper Trading (бумажная торговля)
+7. Live Trading (Virtual) (виртуальная торговля на live данных)
 
 __Примеры использования:__
 
@@ -202,9 +203,10 @@ def main(start_from=1):
             modify_paper_trading_model(model_file),
             run_script('paper_trading.py')
         )),
+        7: ("Live Trading (Virtual)", lambda: run_script('live_trading.py')),
     }
 
-    for step_num in range(start_from, 7):
+    for step_num in range(start_from, 8):
         step_name, step_func = steps[step_num]
         print(f"\nStep {step_num}: {step_name}")
         try:
@@ -222,9 +224,9 @@ if __name__ == "__main__":
     parser.add_argument(
         "--start-from",
         type=int,
-        choices=range(1, 7),
+        choices=range(1, 8),
         default=1,
-        help="Step to start from (1-6): 1=Data Acquisition, 2=Prepare Folders, 3=Modify Scripts, 4=Train Model, 5=Tune Strategy, 6=Paper Trading"
+        help="Step to start from (1-7): 1=Data Acquisition, 2=Prepare Folders, 3=Modify Scripts, 4=Train Model, 5=Tune Strategy, 6=Paper Trading, 7=Live Trading"
     )
     parser.add_argument(
         "--rl",
