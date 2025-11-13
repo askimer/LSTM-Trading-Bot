@@ -56,6 +56,6 @@ if not os.path.exists('btc_usdt_data'):
 if not os.path.exists('btc_usdt_training_data'):
     os.makedirs('btc_usdt_training_data')
 
-start_date = datetime(2024, 1, 1)
+start_date = datetime(2025, 9, 1)
 end_date = datetime.now()
 download_and_process_data(start_date, end_date)

@@ -4,10 +4,10 @@ Reinforcement Learning Trading Agent Training
 Uses PPO algorithm to learn optimal trading strategy
 """
 
-import gym
+import gymnasium as gym
 import numpy as np
 import pandas as pd
-from gym import spaces
+from gymnasium import spaces
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv
 from stable_baselines3.common.callbacks import EvalCallback
@@ -41,14 +41,14 @@ class TradingEnvironment(gym.Env):
 
         self.reset()
 
-    def reset(self):
+    def reset(self, seed=None, options=None):
         self.current_step = 0
         self.balance = self.initial_balance
         self.position = 0  # 0=no position, positive=long
         self.total_fees = 0
         self.portfolio_values = [self.initial_balance]
 
-        return self._get_state()
+        return self._get_state(), {}
 
     def _get_state(self):
         """Get current state observation"""
@@ -80,15 +80,17 @@ class TradingEnvironment(gym.Env):
     def step(self, action):
         """Execute one step in environment"""
         if self.current_step >= len(self.df) - 1:
-            done = True
+            terminated = True
+            truncated = False
             reward = 0
-            return self._get_state(), reward, done, {}
+            return self._get_state(), reward, terminated, truncated, {}
 
         current_price = self.df.iloc[self.current_step]['Close']
         next_price = self.df.iloc[self.current_step + 1]['Close']
 
         reward = 0
-        done = False
+        terminated = False
+        truncated = False
 
         # Execute action
         if action == 1:  # Buy
@@ -137,9 +139,9 @@ class TradingEnvironment(gym.Env):
         self.current_step += 1
 
         if self.current_step >= len(self.df) - 1:
-            done = True
+            terminated = True
 
-        return self._get_state(), reward, done, {}
+        return self._get_state(), reward, terminated, truncated, {}
 
     def render(self, mode='human'):
         """Render environment state"""
@@ -210,14 +212,15 @@ def evaluate_agent(model, data_path, n_episodes=5):
     episode_portfolio_values = []
 
     for episode in range(n_episodes):
-        state = env.reset()
+        state, _ = env.reset()
         done = False
         episode_reward = 0
         portfolio_history = [env.initial_balance]
 
         while not done:
             action, _ = model.predict(state, deterministic=True)
-            state, reward, done, _ = env.step(action)
+            state, reward, terminated, truncated, _ = env.step(action)
+            done = terminated or truncated
             episode_reward += reward
             portfolio_history.append(env.balance + env.position * df.iloc[min(env.current_step, len(df)-1)]['Close'])
 
