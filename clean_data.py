@@ -33,7 +33,7 @@ dtypes = {
 }
 
 i=0
-for chunk in pd.read_csv('./btc_usdt_data/full_btc_usdt_data.csv', chunksize=chunk_size, dtype=dtypes, low_memory=False):
+for chunk in pd.read_csv('./btc_usdt_data/full_btc_usdt_data.csv', chunksize=chunk_size, header=None, names=headers, skiprows=1, low_memory=False):
     cleaned_chunk = clean_data(chunk)
     cleaned_chunk.to_csv(output_file, mode='a', header=not os.path.exists(output_file), index=False)
 
