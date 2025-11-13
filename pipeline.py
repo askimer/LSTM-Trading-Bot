@@ -76,7 +76,7 @@ def modify_train_lstm():
 
     # Replace the data loading line
     old_line = "    df = pd.read_csv('full_btc_usdt_data_feature_engineered.csv')"
-    new_line = "    df = pd.read_csv('btc_usdt_training_data/full_btc_usdt_data_feature_engineered.csv')"
+    new_line = "    df = pd.read_csv('./btc_usdt_training_data/full_btc_usdt_data_feature_engineered.csv')"
     content = content.replace(old_line, new_line)
 
     # Write back
