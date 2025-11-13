@@ -56,7 +56,7 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Training on device {device}.")
     print("Loading data...")
-    df = pd.read_csv('btc_usdt_training_data/full_btc_usdt_data_feature_engineered.csv')
+    df = pd.read_csv('btc_usdt_data/full_btc_usdt_data_feature_engineered.csv')
     df = df.dropna()
 
     print("Removing constant columns...")
