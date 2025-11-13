@@ -39,7 +39,7 @@ def run_script(script_name):
         print(f"Error running {script_name}:")
         print(result.stderr)
         sys.exit(1)
-    # Print the output of the script
+    # Print the output of the scri/Volumes/Movies/PYTHON/LSTM-Algorithmic-Trading-Bot/btc_usdt_training_data/btc_usdt_data/Volumes/Movies/PYTHON/LSTM-Algorithmic-Trading-Bot/btc_usdt_training_data/btc_usdt_datapt
     if result.stdout:
         print(result.stdout.strip())
     print(f"{script_name} completed successfully.")
@@ -47,6 +47,8 @@ def run_script(script_name):
 def rename_data_folder():
     """Rename btc_usdt_data to btc_usdt_training_data."""
     if os.path.exists('btc_usdt_data'):
+        if os.path.exists('btc_usdt_training_data'):
+            shutil.rmtree('btc_usdt_training_data')
         shutil.move('btc_usdt_data', 'btc_usdt_training_data')
         print("Renamed btc_usdt_data to btc_usdt_training_data")
     else:
