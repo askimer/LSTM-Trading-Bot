@@ -100,17 +100,22 @@ class TradingEnvironment(gym.Env):
         self.transaction_fee = transaction_fee
         self.current_step = 0
 
+        # Margin trading parameters
+        self.margin_requirement = 0.5  # 50% initial margin for shorts
+        self.maintenance_margin = 0.25  # 25% maintenance margin
+        self.liquidation_penalty = 0.02  # 2% penalty on liquidation
+
         # Calculate dynamic price normalization based on data
         price_col = 'close' if 'close' in df.columns else 'Close'
         self.price_mean = df[price_col].mean()
         self.price_std = df[price_col].std()
         print(f"Price normalization: mean={self.price_mean:.2f}, std={self.price_std:.2f}")
+        print(f"Margin requirements: initial={self.margin_requirement*100:.0f}%, maintenance={self.maintenance_margin*100:.0f}%")
 
         # Actions: 0=Hold, 1=Buy Long, 2=Sell Long, 3=Sell Short, 4=Buy Short
         self.action_space = spaces.Discrete(5)
 
         # State: [balance_norm, position_norm, price_norm, indicators...]
-        # Indicators: RSI, BB_upper, BB_lower, ATR, OBV, AD, MFI (7 total, removed MACD)
         n_indicators = 7
         self.observation_space = spaces.Box(
             low=-np.inf, high=np.inf,
@@ -122,7 +127,7 @@ class TradingEnvironment(gym.Env):
     def reset(self, seed=None, options=None):
         self.current_step = 0
         self.balance = self.initial_balance
-        self.position = 0  # 0=no position, positive=long
+        self.position = 0  # 0=no position, positive=long, negative=short
         self.total_fees = 0
         self.portfolio_values = [self.initial_balance]
 
@@ -137,7 +142,12 @@ class TradingEnvironment(gym.Env):
 
         # Normalize values
         balance_norm = self.balance / self.initial_balance - 1
-        position_norm = self.position / (self.balance * 0.1) if self.balance > 0 else 0
+        # Normalize position: positive for long, negative for short
+        # Use abs() to handle both long and short positions
+        if self.balance > 0:
+            position_norm = self.position / (self.balance * 0.1)
+        else:
+            position_norm = 0
         current_price = row.get('close', row.get('Close', self.price_mean))  # Support both naming conventions
         price_norm = (current_price - self.price_mean) / self.price_std  # Dynamic z-score normalization
 
@@ -171,24 +181,77 @@ class TradingEnvironment(gym.Env):
         terminated = False
         truncated = False
 
+        # Check for margin call / liquidation before executing action
+        current_portfolio = self.balance + self.position * current_price
+        if self.position != 0:  # Have position
+            # Calculate margin used
+            position_value = abs(self.position) * current_price
+            margin_used = position_value * self.margin_requirement
+
+            # Check maintenance margin
+            if current_portfolio < margin_used * (1 / self.maintenance_margin):
+                # Liquidation triggered
+                print(f"💥 LIQUIDATION: Portfolio ${current_portfolio:.2f} < Required ${margin_used * (1 / self.maintenance_margin):.2f}")
+
+                # Close all positions with penalty
+                if self.position > 0:  # Close long
+                    revenue = self.position * current_price * (1 - self.liquidation_penalty)
+                    self.balance += revenue - (revenue * self.transaction_fee)
+                    self.total_fees += revenue * self.transaction_fee
+                elif self.position < 0:  # Close short
+                    cost = abs(self.position) * current_price * (1 + self.liquidation_penalty)
+                    if self.balance >= cost:
+                        self.balance -= cost + (cost * self.transaction_fee)
+                        self.total_fees += cost * self.transaction_fee
+
+                self.position = 0
+                reward -= 50  # Heavy penalty for liquidation
+                print(f"🔥 Position liquidated with penalty")
+
         # Execute action
         if action == 1:  # Buy Long - открыть/добавить длинную позицию
-            if self.balance > current_price * (1 + self.transaction_fee):
-                # Buy with 10% of balance
-                invest_amount = min(self.balance * 0.1, self.balance - 100)
-                fee = invest_amount * self.transaction_fee
-                coins_bought = (invest_amount - fee) / current_price
+            if self.position < 0:
+                # Convert short to long: close short first, then open long
+                cover_amount = abs(self.position)
+                cost = cover_amount * current_price
+                fee = cost * self.transaction_fee
 
-                self.position += coins_bought
-                self.balance -= invest_amount
-                self.total_fees += fee
+                if self.balance >= cost + fee:
+                    self.position = 0  # Close short
+                    self.balance -= cost + fee
+                    self.total_fees += fee
 
-                # Small penalty for transaction
-                reward -= 0.01
+                    # Now open long position
+                    invest_amount = min(self.balance * 0.1, self.balance - 100)
+                    if invest_amount > 10:
+                        fee_long = invest_amount * self.transaction_fee
+                        coins_bought = (invest_amount - fee_long) / current_price
+
+                        self.position += coins_bought
+                        self.balance -= invest_amount
+                        self.total_fees += fee_long
+
+                        reward -= 0.02  # Extra penalty for conversion
+                        print(f"🔄 Converted short to long position")
+                else:
+                    reward -= 1  # Penalty for failed conversion
+
+            elif self.position >= 0:
+                # Normal long buy
+                if self.balance > current_price * (1 + self.transaction_fee):
+                    invest_amount = min(self.balance * 0.1, self.balance - 100)
+                    fee = invest_amount * self.transaction_fee
+                    coins_bought = (invest_amount - fee) / current_price
+
+                    self.position += coins_bought
+                    self.balance -= invest_amount
+                    self.total_fees += fee
+
+                    reward -= 0.01
 
         elif action == 2:  # Sell Long - закрыть часть длинной позиции
             if self.position > 0:
-                sell_amount = min(self.position * 0.5, self.position)  # Sell up to 50% position
+                sell_amount = min(self.position * 0.5, self.position)
                 revenue = sell_amount * current_price
                 fee = revenue * self.transaction_fee
 
@@ -196,35 +259,61 @@ class TradingEnvironment(gym.Env):
                 self.balance += revenue - fee
                 self.total_fees += fee
 
-                # Small penalty for transaction
                 reward -= 0.01
 
         elif action == 3:  # Sell Short - открыть короткую позицию
-            if self.balance > current_price * (1 + self.transaction_fee):
-                # Short sell with 10% of balance equivalent
-                short_value = min(self.balance * 0.1, self.balance - 100)
-                fee = short_value * self.transaction_fee
-                coins_short = (short_value - fee) / current_price
+            if self.position > 0:
+                # Convert long to short: close long first, then open short
+                sell_amount = self.position
+                revenue = sell_amount * current_price
+                fee = revenue * self.transaction_fee
 
-                self.position -= coins_short  # Negative position = short
-                self.balance += short_value - fee  # Receive money for shorting
+                self.position = 0  # Close long
+                self.balance += revenue - fee
                 self.total_fees += fee
 
-                # Small penalty for transaction
-                reward -= 0.01
+                # Now open short position
+                short_value = min(self.balance * 0.1, self.balance - 100)
+                margin_required = short_value * self.margin_requirement
+                fee_short = short_value * self.transaction_fee
 
-        elif action == 4:  # Buy Short - закрыть короткую позицию
-            if self.position < 0:  # Have short position
-                cover_amount = min(abs(self.position) * 0.5, abs(self.position))  # Cover up to 50% short
+                if self.balance > margin_required + fee_short:
+                    coins_short = (short_value - fee_short) / current_price
+                    self.position -= coins_short
+                    self.balance += short_value - fee_short
+                    self.total_fees += fee_short
+
+                    reward -= 0.02  # Extra penalty for conversion
+                    print(f"🔄 Converted long to short position")
+                else:
+                    reward -= 1  # Penalty for failed conversion
+
+            elif self.position <= 0:
+                # Normal short sell
+                short_value = min(self.balance * 0.1, self.balance - 100)
+                margin_required = short_value * self.margin_requirement
+                fee = short_value * self.transaction_fee
+
+                if self.balance > margin_required + fee:
+                    coins_short = (short_value - fee) / current_price
+                    self.position -= coins_short
+                    self.balance += short_value - fee
+                    self.total_fees += fee
+
+                    reward -= 0.01
+
+        elif action == 4:  # Buy Short - закрыть короткую позицию (cover short)
+            if self.position < 0:
+                cover_amount = min(abs(self.position) * 0.5, abs(self.position))
                 cost = cover_amount * current_price
                 fee = cost * self.transaction_fee
 
-                self.position += cover_amount  # Reduce short position
-                self.balance -= cost + fee  # Pay to cover short
-                self.total_fees += fee
+                if self.balance >= cost + fee:
+                    self.position += cover_amount
+                    self.balance -= cost + fee
+                    self.total_fees += fee
 
-                # Small penalty for transaction
-                reward -= 0.01
+                    reward -= 0.01
 
         # Calculate reward based on portfolio change with risk adjustment
         current_portfolio = self.balance + self.position * current_price
@@ -272,7 +361,7 @@ class TradingEnvironment(gym.Env):
             reward -= abs(price_change_pct) * 500   # Penalty for wrong short cover
 
         # Penalty for holding too long without action (only if position exists)
-        if action == 0 and self.position > 0:
+        if action == 0 and self.position != 0:  # Any position (long or short)
             reward -= 0.01
 
         # Large penalty for going negative
