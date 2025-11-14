@@ -207,7 +207,7 @@ if __name__ == "__main__":
     for _ in range(20):
         combination = {}
         for param_name, param_values in params.items():
-            combination[param_name] = np.random.choice(param_values)
+            combination[param_name] = int(np.random.choice(param_values))  # Convert to int
         param_combinations.append(combination)
 
     for i, param_comb in enumerate(param_combinations, 1):
@@ -240,9 +240,14 @@ if __name__ == "__main__":
 
     print(f"\n🏁 Hyperparameter search completed!")
     print(f"Best score: {best_score:.6f}")
-    print("Best hyperparameters:")
-    for param_name, param_value in best_params.items():
-        print(f"  {param_name}: {param_value}")
+    if best_params is not None:
+        print("Best hyperparameters:")
+        for param_name, param_value in best_params.items():
+            print(f"  {param_name}: {param_value}")
+    else:
+        print("❌ No successful model training - all combinations failed")
+        print("Exiting...")
+        exit(1)
 
     print("Evaluating model...")
     # Make predictions
