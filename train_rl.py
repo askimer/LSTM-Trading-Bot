@@ -11,6 +11,7 @@ from gymnasium import spaces
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv
 from stable_baselines3.common.callbacks import BaseCallback, EvalCallback
+from stable_baselines3.common.monitor import Monitor
 import pickle
 import torch
 import matplotlib.pyplot as plt
@@ -292,7 +293,7 @@ def train_rl_agent(data_path, total_timesteps=100000, eval_freq=10000):
     )
 
     # Evaluation callback
-    eval_env = DummyVecEnv([lambda: TradingEnvironment(df)])
+    eval_env = DummyVecEnv([lambda: Monitor(TradingEnvironment(df), "./rl_logs/")])
     eval_callback = EvalCallback(
         eval_env,
         best_model_save_path="./rl_models/",
