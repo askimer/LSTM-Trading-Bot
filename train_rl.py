@@ -105,12 +105,17 @@ class TradingEnvironment(gym.Env):
         self.maintenance_margin = 0.25  # 25% maintenance margin
         self.liquidation_penalty = 0.02  # 2% penalty on liquidation
 
+        # Trailing stop-loss parameters
+        self.trailing_stop_distance = 0.03  # 3% trailing distance
+        self.trailing_stop_enabled = True
+
         # Calculate dynamic price normalization based on data
         price_col = 'close' if 'close' in df.columns else 'Close'
         self.price_mean = df[price_col].mean()
         self.price_std = df[price_col].std()
         print(f"Price normalization: mean={self.price_mean:.2f}, std={self.price_std:.2f}")
         print(f"Margin requirements: initial={self.margin_requirement*100:.0f}%, maintenance={self.maintenance_margin*100:.0f}%")
+        print(f"Trailing stop-loss: {self.trailing_stop_distance*100:.1f}% distance")
 
         # Actions: 0=Hold, 1=Buy Long, 2=Sell Long, 3=Sell Short, 4=Buy Short
         self.action_space = spaces.Discrete(5)
@@ -130,6 +135,13 @@ class TradingEnvironment(gym.Env):
         self.position = 0  # 0=no position, positive=long, negative=short
         self.total_fees = 0
         self.portfolio_values = [self.initial_balance]
+
+        # Trailing stop-loss tracking
+        self.entry_price = 0
+        self.highest_price_since_entry = 0
+        self.lowest_price_since_entry = float('inf')
+        self.trailing_stop_loss = 0
+        self.trailing_take_profit = 0
 
         return self._get_state(), {}
 
@@ -183,30 +195,111 @@ class TradingEnvironment(gym.Env):
 
         # Check for margin call / liquidation before executing action
         current_portfolio = self.balance + self.position * current_price
-        if self.position != 0:  # Have position
-            # Calculate margin used
+        
+        # Only check margin for short positions (long positions don't use margin in this model)
+        if self.position < 0:  # Short position
             position_value = abs(self.position) * current_price
             margin_used = position_value * self.margin_requirement
+            
+            # Check maintenance margin: equity must be >= position_value * maintenance_margin
+            # Equity = portfolio value - margin_used (simplified)
+            # For shorts: if portfolio drops too much, we need to liquidate
+            required_equity = position_value * self.maintenance_margin
+            
+            if current_portfolio < required_equity:
+                # Liquidation triggered for short position
+                print(f"💥 LIQUIDATION: Portfolio ${current_portfolio:.2f} < Required ${required_equity:.2f}")
 
-            # Check maintenance margin
-            if current_portfolio < margin_used * (1 / self.maintenance_margin):
-                # Liquidation triggered
-                print(f"💥 LIQUIDATION: Portfolio ${current_portfolio:.2f} < Required ${margin_used * (1 / self.maintenance_margin):.2f}")
+                # Force close short position with penalty
+                cost = abs(self.position) * current_price * (1 + self.liquidation_penalty)
+                # If balance insufficient, use all available balance (partial liquidation)
+                if self.balance >= cost:
+                    self.balance -= cost + (cost * self.transaction_fee)
+                    self.total_fees += cost * self.transaction_fee
+                    self.position = 0
+                else:
+                    # Partial liquidation: close as much as possible
+                    max_cover = self.balance / (current_price * (1 + self.liquidation_penalty + self.transaction_fee))
+                    if max_cover > 0:
+                        cost_partial = max_cover * current_price * (1 + self.liquidation_penalty)
+                        self.balance -= cost_partial + (cost_partial * self.transaction_fee)
+                        self.total_fees += cost_partial * self.transaction_fee
+                        self.position += max_cover  # Reduce short position
+                        print(f"⚠️ Partial liquidation: closed {max_cover:.6f} of {abs(self.position):.6f} short position")
 
-                # Close all positions with penalty
-                if self.position > 0:  # Close long
-                    revenue = self.position * current_price * (1 - self.liquidation_penalty)
-                    self.balance += revenue - (revenue * self.transaction_fee)
-                    self.total_fees += revenue * self.transaction_fee
-                elif self.position < 0:  # Close short
-                    cost = abs(self.position) * current_price * (1 + self.liquidation_penalty)
-                    if self.balance >= cost:
-                        self.balance -= cost + (cost * self.transaction_fee)
-                        self.total_fees += cost * self.transaction_fee
-
-                self.position = 0
                 reward -= 50  # Heavy penalty for liquidation
                 print(f"🔥 Position liquidated with penalty")
+        
+        # For long positions, check if portfolio value drops too low (simple stop-loss)
+        elif self.position > 0:
+            if current_portfolio < self.initial_balance * 0.3:  # 70% loss
+                # Force close long position (stop-loss)
+                revenue = self.position * current_price * (1 - self.liquidation_penalty)
+                self.balance += revenue - (revenue * self.transaction_fee)
+                self.total_fees += revenue * self.transaction_fee
+                self.position = 0
+                reward -= 30  # Penalty for stop-loss
+                print(f"🛑 Stop-loss triggered: Long position closed")
+
+        # Update trailing stops for existing positions
+        if self.trailing_stop_enabled and self.position != 0:
+            if self.position > 0:  # Long position
+                # Update highest price since entry
+                if current_price > self.highest_price_since_entry:
+                    self.highest_price_since_entry = current_price
+                    # Update trailing stop-loss (3% below highest price)
+                    self.trailing_stop_loss = self.highest_price_since_entry * (1 - self.trailing_stop_distance)
+
+                # Check trailing stop-loss
+                if current_price <= self.trailing_stop_loss:
+                    # Trailing stop triggered - close long position
+                    revenue = self.position * current_price
+                    fee = revenue * self.transaction_fee
+                    self.balance += revenue - fee
+                    self.total_fees += fee
+
+                    pnl = (current_price - self.entry_price) * self.position - fee
+                    print(f"🎯 Trailing stop triggered: Long closed at ${current_price:.2f}, PnL: ${pnl:.2f}")
+
+                    self.position = 0
+                    self.entry_price = 0
+                    self.highest_price_since_entry = 0
+                    self.trailing_stop_loss = 0
+
+                    reward += 2  # Small bonus for disciplined exit
+                    # Skip normal action processing
+                    self.portfolio_values.append(self.balance + self.position * current_price)
+                    self.current_step += 1
+                    return self._get_state(), reward, terminated, truncated, {}
+
+            elif self.position < 0:  # Short position
+                # Update lowest price since entry
+                if current_price < self.lowest_price_since_entry:
+                    self.lowest_price_since_entry = current_price
+                    # Update trailing stop-loss (3% above lowest price for shorts)
+                    self.trailing_stop_loss = self.lowest_price_since_entry * (1 + self.trailing_stop_distance)
+
+                # Check trailing stop-loss for shorts
+                if current_price >= self.trailing_stop_loss:
+                    # Trailing stop triggered - close short position
+                    cost = abs(self.position) * current_price
+                    fee = cost * self.transaction_fee
+                    self.balance -= cost + fee
+                    self.total_fees += fee
+
+                    pnl = (self.entry_price - current_price) * abs(self.position) - fee
+                    print(f"🎯 Trailing stop triggered: Short closed at ${current_price:.2f}, PnL: ${pnl:.2f}")
+
+                    self.position = 0
+                    self.entry_price = 0
+                    self.lowest_price_since_entry = float('inf')
+                    self.trailing_stop_loss = 0
+
+                    reward += 2  # Small bonus for disciplined exit
+                    # Skip normal action processing
+                    self.portfolio_values.append(self.balance + self.position * current_price)
+                    self.current_step += 1
+                    return self._get_state(), reward, terminated, truncated, {}
 
         # Execute action
         if action == 1:  # Buy Long - открыть/добавить длинную позицию
@@ -216,23 +309,54 @@ class TradingEnvironment(gym.Env):
                 cost = cover_amount * current_price
                 fee = cost * self.transaction_fee
 
+                # Check if we can afford to close short AND open long
                 if self.balance >= cost + fee:
-                    self.position = 0  # Close short
-                    self.balance -= cost + fee
-                    self.total_fees += fee
+                    # Estimate balance after closing short
+                    estimated_balance = self.balance - cost - fee
+                    # Check if we can open long position after closing short
+                    min_investment = current_price * (1 + self.transaction_fee) + 10
 
-                    # Now open long position
-                    invest_amount = min(self.balance * 0.1, self.balance - 100)
-                    if invest_amount > 10:
-                        fee_long = invest_amount * self.transaction_fee
-                        coins_bought = (invest_amount - fee_long) / current_price
+                    if estimated_balance >= min_investment:
+                        # Close short - calculate PnL for conversion bonus
+                        pnl_short = (self.entry_price - current_price) * cover_amount - fee
+                        self.position = 0
+                        self.balance -= cost + fee
+                        self.total_fees += fee
 
-                        self.position += coins_bought
-                        self.balance -= invest_amount
-                        self.total_fees += fee_long
+                        # Reset trailing stops
+                        self.entry_price = 0
+                        self.lowest_price_since_entry = float('inf')
+                        self.trailing_stop_loss = 0
 
-                        reward -= 0.02  # Extra penalty for conversion
-                        print(f"🔄 Converted short to long position")
+                        # Now open long position
+                        invest_amount = min(self.balance * 0.1, self.balance - 100)
+                        if invest_amount > 10:
+                            fee_long = invest_amount * self.transaction_fee
+                            coins_bought = (invest_amount - fee_long) / current_price
+
+                            self.position += coins_bought
+                            self.balance -= invest_amount
+                            self.total_fees += fee_long
+
+                            # Initialize trailing stops for new long position
+                            self.entry_price = current_price
+                            self.highest_price_since_entry = current_price
+                            self.trailing_stop_loss = current_price * (1 - self.trailing_stop_distance)
+
+                            # Bonus for successful conversion
+                            conversion_bonus = 5 + (pnl_short * 0.1 if pnl_short > 0 else 0)
+                            reward += conversion_bonus
+                            print(f"🔄💰 Converted short to long: PnL ${pnl_short:.2f}, Bonus +{conversion_bonus:.1f}")
+                        else:
+                            # Short closed but can't open long - bonus for closing profitable short
+                            if pnl_short > 0:
+                                reward += 3
+                                print(f"🔄✅ Closed profitable short: PnL ${pnl_short:.2f}")
+                            else:
+                                reward -= 0.5  # Smaller penalty for partial conversion
+                    else:
+                        # Can't afford conversion - don't close short
+                        reward -= 1  # Penalty for failed conversion
                 else:
                     reward -= 1  # Penalty for failed conversion
 
@@ -242,6 +366,12 @@ class TradingEnvironment(gym.Env):
                     invest_amount = min(self.balance * 0.1, self.balance - 100)
                     fee = invest_amount * self.transaction_fee
                     coins_bought = (invest_amount - fee) / current_price
+
+                    # Initialize trailing stops for new position
+                    if self.position == 0:  # First long position
+                        self.entry_price = current_price
+                        self.highest_price_since_entry = current_price
+                        self.trailing_stop_loss = current_price * (1 - self.trailing_stop_distance)
 
                     self.position += coins_bought
                     self.balance -= invest_amount
@@ -268,9 +398,17 @@ class TradingEnvironment(gym.Env):
                 revenue = sell_amount * current_price
                 fee = revenue * self.transaction_fee
 
+                # Calculate PnL for conversion bonus
+                pnl_long = (current_price - self.entry_price) * sell_amount - fee
+
                 self.position = 0  # Close long
                 self.balance += revenue - fee
                 self.total_fees += fee
+
+                # Reset trailing stops
+                self.entry_price = 0
+                self.highest_price_since_entry = 0
+                self.trailing_stop_loss = 0
 
                 # Now open short position
                 short_value = min(self.balance * 0.1, self.balance - 100)
@@ -283,10 +421,22 @@ class TradingEnvironment(gym.Env):
                     self.balance += short_value - fee_short
                     self.total_fees += fee_short
 
-                    reward -= 0.02  # Extra penalty for conversion
-                    print(f"🔄 Converted long to short position")
+                    # Initialize trailing stops for new short position
+                    self.entry_price = current_price
+                    self.lowest_price_since_entry = current_price
+                    self.trailing_stop_loss = current_price * (1 + self.trailing_stop_distance)
+
+                    # Bonus for successful conversion
+                    conversion_bonus = 5 + (pnl_long * 0.1 if pnl_long > 0 else 0)
+                    reward += conversion_bonus
+                    print(f"🔄💰 Converted long to short: PnL ${pnl_long:.2f}, Bonus +{conversion_bonus:.1f}")
                 else:
-                    reward -= 1  # Penalty for failed conversion
+                    # Long closed but can't open short - bonus for closing profitable long
+                    if pnl_long > 0:
+                        reward += 3
+                        print(f"🔄✅ Closed profitable long: PnL ${pnl_long:.2f}")
+                    else:
+                        reward -= 0.5  # Smaller penalty for partial conversion
 
             elif self.position <= 0:
                 # Normal short sell
@@ -299,6 +449,12 @@ class TradingEnvironment(gym.Env):
                     self.position -= coins_short
                     self.balance += short_value - fee
                     self.total_fees += fee
+
+                    # Initialize trailing stops for new position
+                    if self.position == -coins_short:  # First short position
+                        self.entry_price = current_price
+                        self.lowest_price_since_entry = current_price
+                        self.trailing_stop_loss = current_price * (1 + self.trailing_stop_distance)
 
                     reward -= 0.01
 
