@@ -28,12 +28,18 @@ class TradingEnvironment(gym.Env):
         self.transaction_fee = transaction_fee
         self.current_step = 0
 
+        # Calculate dynamic price normalization based on data
+        price_col = 'close' if 'close' in df.columns else 'Close'
+        self.price_mean = df[price_col].mean()
+        self.price_std = df[price_col].std()
+        print(f"Price normalization: mean={self.price_mean:.2f}, std={self.price_std:.2f}")
+
         # Actions: 0=Hold, 1=Buy, 2=Sell
         self.action_space = spaces.Discrete(3)
 
         # State: [balance_norm, position_norm, price_norm, indicators...]
-        # Indicators: RSI, MACD, BB_upper, BB_lower, ATR, OBV, AD, MFI
-        n_indicators = 8
+        # Indicators: RSI, BB_upper, BB_lower, ATR, OBV, AD, MFI (7 total, removed MACD)
+        n_indicators = 7
         self.observation_space = spaces.Box(
             low=-np.inf, high=np.inf,
             shape=(3 + n_indicators,), dtype=np.float32
@@ -60,18 +66,18 @@ class TradingEnvironment(gym.Env):
         # Normalize values
         balance_norm = self.balance / self.initial_balance - 1
         position_norm = self.position / (self.balance * 0.1) if self.balance > 0 else 0
-        price_norm = row['Close'] / 50000 - 1  # Normalize around typical BTC price
+        current_price = row.get('close', row.get('Close', self.price_mean))  # Support both naming conventions
+        price_norm = (current_price - self.price_mean) / self.price_std  # Dynamic z-score normalization
 
-        # Technical indicators
+        # Technical indicators (removed MACD as it's not calculated in feature_engineer.py)
         indicators = [
-            row.get('RSI_15', 50) / 100 - 0.5,
-            row.get('MACD_macd', 0) / 1000,
-            row.get('BB_15_upper', row['Close']) / row['Close'] - 1,
-            row.get('BB_15_lower', row['Close']) / row['Close'] - 1,
-            row.get('ATR_15', 100) / 1000,
-            row.get('OBV', 0) / 1e10,
-            row.get('AD', 0) / 1e10,
-            row.get('MFI_15', 50) / 100 - 0.5
+            row.get('RSI_15', 50) / 100 - 0.5,  # RSI normalized to [-0.5, 0.5]
+            (row.get('BB_15_upper', current_price) / current_price - 1) if current_price > 0 else 0,  # BB upper as % deviation
+            (row.get('BB_15_lower', current_price) / current_price - 1) if current_price > 0 else 0,  # BB lower as % deviation
+            row.get('ATR_15', 100) / 1000,  # ATR normalized
+            row.get('OBV', 0) / 1e10,  # OBV normalized
+            row.get('AD', 0) / 1e10,  # AD normalized
+            row.get('MFI_15', 50) / 100 - 0.5  # MFI normalized to [-0.5, 0.5]
         ]
 
         state = np.array([balance_norm, position_norm, price_norm] + indicators, dtype=np.float32)
@@ -85,8 +91,9 @@ class TradingEnvironment(gym.Env):
             reward = 0
             return self._get_state(), reward, terminated, truncated, {}
 
-        current_price = self.df.iloc[self.current_step]['Close']
-        next_price = self.df.iloc[self.current_step + 1]['Close']
+        # Support both 'close' and 'Close' column names
+        current_price = self.df.iloc[self.current_step].get('close', self.df.iloc[self.current_step].get('Close'))
+        next_price = self.df.iloc[self.current_step + 1].get('close', self.df.iloc[self.current_step + 1].get('Close'))
 
         reward = 0
         terminated = False
@@ -120,12 +127,25 @@ class TradingEnvironment(gym.Env):
                 # Small penalty for transaction
                 reward -= 0.01
 
-        # Calculate reward based on portfolio change
+        # Calculate reward based on portfolio change with risk adjustment
         current_portfolio = self.balance + self.position * current_price
         next_portfolio = self.balance + self.position * next_price
 
         portfolio_change = (next_portfolio - current_portfolio) / current_portfolio if current_portfolio > 0 else 0
-        reward += portfolio_change * 100  # Scale reward
+
+        # Risk-adjusted reward: portfolio return minus volatility penalty
+        # Calculate rolling volatility (simplified Sharpe-like component)
+        if len(self.portfolio_values) >= 10:
+            recent_portfolio_values = self.portfolio_values[-10:]
+            returns = np.diff(recent_portfolio_values) / recent_portfolio_values[:-1]
+            volatility = np.std(returns) if len(returns) > 0 else 0
+            # Penalize high volatility (risk-adjusted component)
+            risk_penalty = volatility * 50  # Scale volatility penalty
+        else:
+            risk_penalty = 0
+
+        # Main reward: portfolio change minus risk penalty
+        reward += (portfolio_change * 100) - risk_penalty
 
         # Penalty for holding too long without action
         if action == 0 and self.position > 0:
@@ -145,7 +165,8 @@ class TradingEnvironment(gym.Env):
 
     def render(self, mode='human'):
         """Render environment state"""
-        portfolio_value = self.balance + self.position * self.df.iloc[self.current_step]['Close']
+        current_price = self.df.iloc[self.current_step].get('close', self.df.iloc[self.current_step].get('Close'))
+        portfolio_value = self.balance + self.position * current_price
         print(f"Step: {self.current_step}, Balance: {self.balance:.2f}, Position: {self.position:.6f}, Portfolio: {portfolio_value:.2f}")
 
 def train_rl_agent(data_path, total_timesteps=100000, eval_freq=10000):
@@ -153,7 +174,30 @@ def train_rl_agent(data_path, total_timesteps=100000, eval_freq=10000):
 
     print("Loading training data...")
     df = pd.read_csv(data_path)
+
+    # Validate data
+    print(f"Loaded {len(df)} rows of data")
+    if df.empty:
+        raise ValueError(f"No data found in {data_path}")
+
+    # Check for required columns
+    required_columns = ['close', 'ATR_15', 'RSI_15', 'BB_15_upper', 'BB_15_lower', 'OBV', 'AD', 'MFI_15']
+    missing_columns = [col for col in required_columns if col not in df.columns and f'{col}_15' not in df.columns]
+    if missing_columns:
+        raise ValueError(f"Missing required columns: {missing_columns}")
+
+    # Clean data
     df = df.dropna()
+    print(f"After dropping NaN: {len(df)} rows")
+
+    if df.empty:
+        raise ValueError("All data was removed after dropping NaN values")
+
+    # Check minimum data requirements for RL training
+    if len(df) < 1000:
+        print(f"WARNING: Limited data for RL training ({len(df)} rows). Consider using more historical data.")
+
+    print(f"Final dataset: {len(df)} rows, {len(df.columns)} features")
 
     print("Creating RL environment...")
     env = DummyVecEnv([lambda: TradingEnvironment(df)])
@@ -222,7 +266,8 @@ def evaluate_agent(model, data_path, n_episodes=5):
             state, reward, terminated, truncated, _ = env.step(action)
             done = terminated or truncated
             episode_reward += reward
-            portfolio_history.append(env.balance + env.position * df.iloc[min(env.current_step, len(df)-1)]['Close'])
+            current_price = df.iloc[min(env.current_step, len(df)-1)].get('close', df.iloc[min(env.current_step, len(df)-1)].get('Close'))
+            portfolio_history.append(env.balance + env.position * current_price)
 
         episode_rewards.append(episode_reward)
         episode_portfolio_values.append(portfolio_history)
