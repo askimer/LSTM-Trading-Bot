@@ -33,8 +33,8 @@ class TradingEnvironment(gym.Env):
         self.price_mean = df[price_col].mean()
         self.price_std = df[price_col].std()
 
-        # Actions: 0=Hold, 1=Buy, 2=Sell
-        self.action_space = spaces.Discrete(3)
+        # Actions: 0=Hold, 1=Buy Long, 2=Sell Long, 3=Sell Short, 4=Buy Short
+        self.action_space = spaces.Discrete(5)
 
         # State: [balance_norm, position_norm, price_norm, indicators...]
         n_indicators = 7
@@ -314,10 +314,10 @@ def run_rl_paper_trading(model_path, data_path, initial_balance=10000):
                 trade_executed = True
                 continue  # Skip normal RL action this step
 
-        # Execute trade logic (simplified version)
+        # Execute trade logic (updated for short positions)
         trade_executed = False
 
-        if action == 1:  # Buy
+        if action == 1:  # Buy Long - открыть/добавить длинную позицию
             if balance > current_price * 1.002:  # Account for fee
                 invest_amount = min(balance * 0.1, balance)  # Max 10% of balance
                 if invest_amount > 10:  # Minimum trade
@@ -332,7 +332,7 @@ def run_rl_paper_trading(model_path, data_path, initial_balance=10000):
 
                     trades.append({
                         'step': step_count,
-                        'type': 'BUY',
+                        'type': 'BUY_LONG',
                         'price': current_price,
                         'amount': btc_amount,
                         'value': invest_amount,
@@ -340,7 +340,7 @@ def run_rl_paper_trading(model_path, data_path, initial_balance=10000):
                     })
                     trade_executed = True
 
-        elif action == 2:  # Sell
+        elif action == 2:  # Sell Long - закрыть часть длинной позиции
             if position > 0:
                 sell_amount = min(position * 0.5, position)  # Sell max 50% position
                 if sell_amount * current_price > 10:  # Minimum trade value
@@ -357,10 +357,59 @@ def run_rl_paper_trading(model_path, data_path, initial_balance=10000):
 
                     trades.append({
                         'step': step_count,
-                        'type': 'SELL',
+                        'type': 'SELL_LONG',
                         'price': current_price,
                         'amount': sell_amount,
                         'value': revenue_after_fee,
+                        'fee': fee,
+                        'pnl': pnl
+                    })
+                    trade_executed = True
+
+        elif action == 3:  # Sell Short - открыть короткую позицию
+            if balance > current_price * 1.002:  # Account for fee
+                short_value = min(balance * 0.1, balance)  # Max 10% of balance equivalent
+                if short_value > 10:  # Minimum trade
+                    fee = short_value * 0.0018
+                    short_after_fee = short_value - fee
+                    btc_amount = short_after_fee / current_price
+
+                    position -= btc_amount  # Negative position = short
+                    balance += short_value  # Receive money for shorting
+                    total_fees += fee
+                    entry_price = current_price
+
+                    trades.append({
+                        'step': step_count,
+                        'type': 'SELL_SHORT',
+                        'price': current_price,
+                        'amount': btc_amount,
+                        'value': short_value,
+                        'fee': fee
+                    })
+                    trade_executed = True
+
+        elif action == 4:  # Buy Short - закрыть короткую позицию
+            if position < 0:  # Have short position
+                cover_amount = min(abs(position) * 0.5, abs(position))  # Cover max 50% short
+                if cover_amount * current_price > 10:  # Minimum trade value
+                    cost = cover_amount * current_price
+                    fee = cost * 0.0018
+                    cost_with_fee = cost + fee
+
+                    position += cover_amount  # Reduce short position
+                    balance -= cost_with_fee  # Pay to cover short
+                    total_fees += fee
+
+                    # Calculate P&L for short position
+                    pnl = (entry_price - current_price) * cover_amount - fee
+
+                    trades.append({
+                        'step': step_count,
+                        'type': 'BUY_SHORT',
+                        'price': current_price,
+                        'amount': cover_amount,
+                        'value': cost_with_fee,
                         'fee': fee,
                         'pnl': pnl
                     })
@@ -457,20 +506,36 @@ def run_rl_paper_trading(model_path, data_path, initial_balance=10000):
     # Trade markers
     plt.subplot(2, 2, 4)
     plt.plot(steps, prices, label='BTC Price')
-    buy_trades = [t for t in trades if t['type'] == 'BUY']
-    sell_trades = [t for t in trades if t['type'] == 'SELL']
 
-    if buy_trades:
-        buy_steps = [t['step'] for t in buy_trades]
-        buy_prices = [t['price'] for t in buy_trades]
-        plt.scatter(buy_steps, buy_prices, color='green', marker='^', s=50, label='Buy')
+    # Long trades
+    buy_long_trades = [t for t in trades if t['type'] == 'BUY_LONG']
+    sell_long_trades = [t for t in trades if t['type'] == 'SELL_LONG']
 
-    if sell_trades:
-        sell_steps = [t['step'] for t in sell_trades]
-        sell_prices = [t['price'] for t in sell_trades]
-        plt.scatter(sell_steps, sell_prices, color='red', marker='v', s=50, label='Sell')
+    if buy_long_trades:
+        bl_steps = [t['step'] for t in buy_long_trades]
+        bl_prices = [t['price'] for t in buy_long_trades]
+        plt.scatter(bl_steps, bl_prices, color='green', marker='^', s=50, label='Buy Long')
 
-    # Add stop-loss and take-profit markers
+    if sell_long_trades:
+        sl_steps = [t['step'] for t in sell_long_trades]
+        sl_prices = [t['price'] for t in sell_long_trades]
+        plt.scatter(sl_steps, sl_prices, color='red', marker='v', s=50, label='Sell Long')
+
+    # Short trades
+    sell_short_trades = [t for t in trades if t['type'] == 'SELL_SHORT']
+    buy_short_trades = [t for t in trades if t['type'] == 'BUY_SHORT']
+
+    if sell_short_trades:
+        ss_steps = [t['step'] for t in sell_short_trades]
+        ss_prices = [t['price'] for t in sell_short_trades]
+        plt.scatter(ss_steps, ss_prices, color='orange', marker='1', s=50, label='Sell Short')
+
+    if buy_short_trades:
+        bs_steps = [t['step'] for t in buy_short_trades]
+        bs_prices = [t['price'] for t in buy_short_trades]
+        plt.scatter(bs_steps, bs_prices, color='purple', marker='2', s=50, label='Buy Short')
+
+    # Risk management markers
     stop_loss_trades = [t for t in trades if 'STOP-LOSS' in t.get('type', '')]
     take_profit_trades = [t for t in trades if 'TAKE-PROFIT' in t.get('type', '')]
 

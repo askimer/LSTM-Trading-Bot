@@ -48,8 +48,8 @@ class TradingEnvironment(gym.Env):
         self.price_mean = df[price_col].mean()
         self.price_std = df[price_col].std()
 
-        # Actions: 0=Hold, 1=Buy, 2=Sell
-        self.action_space = spaces.Discrete(3)
+        # Actions: 0=Hold, 1=Buy Long, 2=Sell Long, 3=Sell Short, 4=Buy Short
+        self.action_space = spaces.Discrete(5)
 
         # State: [balance_norm, position_norm, price_norm, indicators...]
         n_indicators = 7
@@ -484,11 +484,11 @@ class RLLiveTradingBot:
             return np.zeros(10, dtype=np.float32)  # Fallback state
 
     def execute_virtual_trade(self, action, current_price):
-        """Execute virtual trade (no real transactions)"""
+        """Execute virtual trade (no real transactions) - updated for short positions"""
         try:
             trade_executed = False
 
-            if action == 1:  # Buy
+            if action == 1:  # Buy Long - открыть/добавить длинную позицию
                 if self.balance > current_price * 1.002:  # Account for fee
                     invest_amount = min(self.balance * 0.1, self.balance * 0.5)  # Max 10% or 50% of balance
                     if invest_amount > 10:  # Minimum trade
@@ -503,7 +503,7 @@ class RLLiveTradingBot:
 
                         trade = {
                             'timestamp': datetime.now(),
-                            'type': 'BUY',
+                            'type': 'BUY_LONG',
                             'price': current_price,
                             'amount': btc_amount,
                             'value': invest_amount,
@@ -515,9 +515,9 @@ class RLLiveTradingBot:
                         self.trades.append(trade)
                         trade_executed = True
 
-                        logger.info(f"VIRTUAL BUY: {btc_amount:.6f} BTC at ${current_price:.2f}")
+                        logger.info(f"VIRTUAL BUY LONG: {btc_amount:.6f} BTC at ${current_price:.2f}")
 
-            elif action == 2:  # Sell
+            elif action == 2:  # Sell Long - закрыть часть длинной позиции
                 if self.position > 0:
                     sell_amount = min(self.position * 0.5, self.position)  # Sell max 50% position
                     if sell_amount * current_price > 10:  # Minimum trade value
@@ -533,7 +533,7 @@ class RLLiveTradingBot:
 
                         trade = {
                             'timestamp': datetime.now(),
-                            'type': 'SELL',
+                            'type': 'SELL_LONG',
                             'price': current_price,
                             'amount': sell_amount,
                             'value': revenue_after_fee,
@@ -546,7 +546,67 @@ class RLLiveTradingBot:
                         self.trades.append(trade)
                         trade_executed = True
 
-                        logger.info(f"VIRTUAL SELL: {sell_amount:.6f} BTC at ${current_price:.2f}, PnL: ${pnl:.2f}")
+                        logger.info(f"VIRTUAL SELL LONG: {sell_amount:.6f} BTC at ${current_price:.2f}, PnL: ${pnl:.2f}")
+
+            elif action == 3:  # Sell Short - открыть короткую позицию
+                if self.balance > current_price * 1.002:  # Account for fee
+                    short_value = min(self.balance * 0.1, self.balance)  # Max 10% of balance equivalent
+                    if short_value > 10:  # Minimum trade
+                        fee = short_value * 0.0018
+                        short_after_fee = short_value - fee
+                        btc_amount = short_after_fee / current_price
+
+                        self.position -= btc_amount  # Negative position = short
+                        self.balance += short_value  # Receive money for shorting
+                        self.entry_price = current_price
+                        self.total_fees += fee
+
+                        trade = {
+                            'timestamp': datetime.now(),
+                            'type': 'SELL_SHORT',
+                            'price': current_price,
+                            'amount': btc_amount,
+                            'value': short_value,
+                            'fee': fee,
+                            'balance_after': self.balance,
+                            'position_after': self.position
+                        }
+
+                        self.trades.append(trade)
+                        trade_executed = True
+
+                        logger.info(f"VIRTUAL SELL SHORT: {btc_amount:.6f} BTC at ${current_price:.2f}")
+
+            elif action == 4:  # Buy Short - закрыть короткую позицию
+                if self.position < 0:  # Have short position
+                    cover_amount = min(abs(self.position) * 0.5, abs(self.position))  # Cover max 50% short
+                    if cover_amount * current_price > 10:  # Minimum trade value
+                        cost = cover_amount * current_price
+                        fee = cost * 0.0018
+                        cost_with_fee = cost + fee
+
+                        pnl = (self.entry_price - current_price) * cover_amount - fee  # Profit from short
+
+                        self.position += cover_amount  # Reduce short position
+                        self.balance -= cost_with_fee  # Pay to cover short
+                        self.total_fees += fee
+
+                        trade = {
+                            'timestamp': datetime.now(),
+                            'type': 'BUY_SHORT',
+                            'price': current_price,
+                            'amount': cover_amount,
+                            'value': cost_with_fee,
+                            'fee': fee,
+                            'pnl': pnl,
+                            'balance_after': self.balance,
+                            'position_after': self.position
+                        }
+
+                        self.trades.append(trade)
+                        trade_executed = True
+
+                        logger.info(f"VIRTUAL BUY SHORT: {cover_amount:.6f} BTC at ${current_price:.2f}, PnL: ${pnl:.2f}")
 
             return trade_executed
 

@@ -106,8 +106,8 @@ class TradingEnvironment(gym.Env):
         self.price_std = df[price_col].std()
         print(f"Price normalization: mean={self.price_mean:.2f}, std={self.price_std:.2f}")
 
-        # Actions: 0=Hold, 1=Buy, 2=Sell
-        self.action_space = spaces.Discrete(3)
+        # Actions: 0=Hold, 1=Buy Long, 2=Sell Long, 3=Sell Short, 4=Buy Short
+        self.action_space = spaces.Discrete(5)
 
         # State: [balance_norm, position_norm, price_norm, indicators...]
         # Indicators: RSI, BB_upper, BB_lower, ATR, OBV, AD, MFI (7 total, removed MACD)
@@ -172,7 +172,7 @@ class TradingEnvironment(gym.Env):
         truncated = False
 
         # Execute action
-        if action == 1:  # Buy
+        if action == 1:  # Buy Long - открыть/добавить длинную позицию
             if self.balance > current_price * (1 + self.transaction_fee):
                 # Buy with 10% of balance
                 invest_amount = min(self.balance * 0.1, self.balance - 100)
@@ -186,14 +186,41 @@ class TradingEnvironment(gym.Env):
                 # Small penalty for transaction
                 reward -= 0.01
 
-        elif action == 2:  # Sell
+        elif action == 2:  # Sell Long - закрыть часть длинной позиции
             if self.position > 0:
-                sell_amount = self.position * 0.5  # Sell 50% position
+                sell_amount = min(self.position * 0.5, self.position)  # Sell up to 50% position
                 revenue = sell_amount * current_price
                 fee = revenue * self.transaction_fee
 
                 self.position -= sell_amount
                 self.balance += revenue - fee
+                self.total_fees += fee
+
+                # Small penalty for transaction
+                reward -= 0.01
+
+        elif action == 3:  # Sell Short - открыть короткую позицию
+            if self.balance > current_price * (1 + self.transaction_fee):
+                # Short sell with 10% of balance equivalent
+                short_value = min(self.balance * 0.1, self.balance - 100)
+                fee = short_value * self.transaction_fee
+                coins_short = (short_value - fee) / current_price
+
+                self.position -= coins_short  # Negative position = short
+                self.balance += short_value - fee  # Receive money for shorting
+                self.total_fees += fee
+
+                # Small penalty for transaction
+                reward -= 0.01
+
+        elif action == 4:  # Buy Short - закрыть короткую позицию
+            if self.position < 0:  # Have short position
+                cover_amount = min(abs(self.position) * 0.5, abs(self.position))  # Cover up to 50% short
+                cost = cover_amount * current_price
+                fee = cost * self.transaction_fee
+
+                self.position += cover_amount  # Reduce short position
+                self.balance -= cost + fee  # Pay to cover short
                 self.total_fees += fee
 
                 # Small penalty for transaction
@@ -216,12 +243,37 @@ class TradingEnvironment(gym.Env):
         else:
             risk_penalty = 0
 
-        # Main reward: portfolio change minus risk penalty
-        reward += (portfolio_change * 100) - risk_penalty
+        # Main reward: portfolio change scaled appropriately
+        # Scale by 10000 to make rewards more meaningful (0.1% change = 10 reward)
+        # This is important because minute-level price changes are very small
+        reward += (portfolio_change * 10000) - risk_penalty
 
-        # Penalty for holding too long without action
+        # Reward for good trading decisions (updated for short positions)
+        price_change_pct = (next_price - current_price) / current_price if current_price > 0 else 0
+
+        # Long position rewards
+        if action == 1 and price_change_pct > 0:
+            reward += abs(price_change_pct) * 1000  # Bonus for correct long buy
+        if action == 1 and price_change_pct < 0:
+            reward -= abs(price_change_pct) * 500   # Penalty for wrong long buy
+        if action == 2 and price_change_pct < 0:
+            reward += abs(price_change_pct) * 1000  # Bonus for correct long sell
+        if action == 2 and price_change_pct > 0:
+            reward -= abs(price_change_pct) * 500   # Penalty for wrong long sell
+
+        # Short position rewards
+        if action == 3 and price_change_pct < 0:
+            reward += abs(price_change_pct) * 1000  # Bonus for correct short sell
+        if action == 3 and price_change_pct > 0:
+            reward -= abs(price_change_pct) * 500   # Penalty for wrong short sell
+        if action == 4 and price_change_pct > 0:
+            reward += abs(price_change_pct) * 1000  # Bonus for correct short cover
+        if action == 4 and price_change_pct < 0:
+            reward -= abs(price_change_pct) * 500   # Penalty for wrong short cover
+
+        # Penalty for holding too long without action (only if position exists)
         if action == 0 and self.position > 0:
-            reward -= 0.001
+            reward -= 0.01
 
         # Large penalty for going negative
         if current_portfolio < self.initial_balance * 0.5:
@@ -242,7 +294,20 @@ class TradingEnvironment(gym.Env):
         print(f"Step: {self.current_step}, Balance: {self.balance:.2f}, Position: {self.position:.6f}, Portfolio: {portfolio_value:.2f}")
 
 def train_rl_agent(data_path, total_timesteps=100000, eval_freq=10000):
-    """Train RL agent using PPO"""
+    """
+    Train RL agent using PPO
+    
+    Recommendations for timesteps:
+    - Quick testing: 50,000 - 100,000 steps
+    - Development: 200,000 - 500,000 steps  
+    - Production: 1,000,000 - 5,000,000 steps
+    
+    Note: More timesteps generally lead to better performance, but diminishing returns
+    after 1-2M steps for most trading tasks. The optimal depends on:
+    - Complexity of the trading strategy
+    - Amount of training data
+    - Market conditions variability
+    """
 
     print("Loading training data...")
     df = pd.read_csv(data_path)
@@ -292,13 +357,25 @@ def train_rl_agent(data_path, total_timesteps=100000, eval_freq=10000):
         tensorboard_log="./rl_tensorboard/"
     )
 
-    # Evaluation callback
-    eval_env = DummyVecEnv([lambda: Monitor(TradingEnvironment(df), "./rl_logs/")])
+    # Evaluation callback - use subset of data for faster evaluation
+    # Use last 10% of data for evaluation (much faster than full dataset)
+    # This prevents the massive slowdown you experienced (TPS dropped from 180 to 12)
+    eval_df = df.tail(max(1000, len(df) // 10)).reset_index(drop=True)
+    eval_env = DummyVecEnv([lambda: Monitor(TradingEnvironment(eval_df), "./rl_logs/")])
+    
+    # Adjust eval frequency based on total timesteps
+    # For longer training, evaluate less frequently to avoid slowdowns
+    if total_timesteps > 500000:
+        actual_eval_freq = max(eval_freq, total_timesteps // 20)  # Max 20 evaluations
+    else:
+        actual_eval_freq = eval_freq
+    
     eval_callback = EvalCallback(
         eval_env,
         best_model_save_path="./rl_models/",
         log_path="./rl_logs/",
-        eval_freq=eval_freq,
+        eval_freq=actual_eval_freq,
+        n_eval_episodes=1,  # Only 1 episode for faster evaluation
         deterministic=True,
         render=False
     )
@@ -372,8 +449,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train RL Trading Agent")
     parser.add_argument("--data", default="btc_usdt_training_data/full_btc_usdt_data_feature_engineered.csv",
                        help="Path to training data")
-    parser.add_argument("--timesteps", type=int, default=50000,
-                       help="Total training timesteps")
+    parser.add_argument("--timesteps", type=int, default=500000,
+                       help="Total training timesteps (default: 500000. For production: 1M-5M recommended)")
     parser.add_argument("--eval", action="store_true",
                        help="Evaluate trained agent")
 
