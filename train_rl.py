@@ -10,11 +10,82 @@ import pandas as pd
 from gymnasium import spaces
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv
-from stable_baselines3.common.callbacks import EvalCallback
+from stable_baselines3.common.callbacks import BaseCallback, EvalCallback
 import pickle
 import torch
 import matplotlib.pyplot as plt
 from sklearn.preprocessing import StandardScaler
+import time
+
+class RLTrainingProgressCallback(BaseCallback):
+    """Custom callback to show detailed RL training progress"""
+
+    def __init__(self, total_timesteps, eval_freq=10000, verbose=1):
+        super().__init__(verbose)
+        self.total_timesteps = total_timesteps
+        self.eval_freq = eval_freq
+        self.start_time = None
+        self.last_eval_time = None
+        self.episode_rewards = []
+        self.episode_lengths = []
+
+    def _on_training_start(self):
+        """Called at the beginning of training"""
+        self.start_time = time.time()
+        print("🚀 Starting RL Training")
+        print("=" * 60)
+        print(f"Total timesteps: {self.total_timesteps:,}")
+        print(f"Evaluation frequency: {self.eval_freq:,} timesteps")
+        print()
+
+    def _on_step(self):
+        """Called at each step"""
+        # Calculate progress
+        current_timestep = self.num_timesteps
+        progress = current_timestep / self.total_timesteps
+
+        # Show progress every 1000 timesteps or at key milestones
+        if current_timestep % 1000 == 0 or progress >= 1.0:
+            elapsed = time.time() - self.start_time
+            timesteps_per_sec = current_timestep / elapsed if elapsed > 0 else 0
+            eta_seconds = (self.total_timesteps - current_timestep) / timesteps_per_sec if timesteps_per_sec > 0 else 0
+
+            # Format ETA
+            if eta_seconds < 60:
+                eta_str = f"{eta_seconds:.1f}s"
+            elif eta_seconds < 3600:
+                eta_str = f"{eta_seconds/60:.1f}min"
+            else:
+                eta_str = f"{eta_seconds/3600:.1f}h"
+
+            # Progress bar
+            bar_length = 30
+            filled_length = int(bar_length * progress)
+            bar = "█" * filled_length + "░" * (bar_length - filled_length)
+
+            print(f"📈 Timestep {current_timestep:6,}/{self.total_timesteps:6,} | [{bar}] {progress*100:5.1f}% | TPS: {timesteps_per_sec:6.0f} | ETA: {eta_str}")
+
+        # Show evaluation results
+        if self.eval_freq > 0 and current_timestep % self.eval_freq == 0 and current_timestep > 0:
+            if hasattr(self, 'last_mean_reward'):
+                eval_elapsed = time.time() - (self.last_eval_time or self.start_time)
+                print(f"🎯 Evaluation at {current_timestep:,} timesteps:")
+                print(f"   Mean Reward: {self.last_mean_reward:.2f}")
+                print(f"   Mean Episode Length: {self.last_mean_length:.1f}")
+                print(f"   Evaluation Time: {eval_elapsed:.1f}s")
+                print()
+
+        return True
+
+    def _on_training_end(self):
+        """Called at the end of training"""
+        total_time = time.time() - self.start_time
+        print()
+        print("✅ RL Training Completed!")
+        print("=" * 60)
+        print(f"Total training time: {total_time:.1f}s")
+        print(f"Average timesteps/second: {self.total_timesteps/total_time:.1f}")
+        print()
 
 class TradingEnvironment(gym.Env):
     """
@@ -231,11 +302,16 @@ def train_rl_agent(data_path, total_timesteps=100000, eval_freq=10000):
         render=False
     )
 
+    # Custom progress callback
+    progress_callback = RLTrainingProgressCallback(
+        total_timesteps=total_timesteps,
+        eval_freq=eval_freq
+    )
+
     print("Starting training...")
     model.learn(
         total_timesteps=total_timesteps,
-        callback=eval_callback,
-        progress_bar=True
+        callback=[progress_callback, eval_callback]
     )
 
     print("Saving final model...")
