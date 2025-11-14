@@ -13,6 +13,7 @@ import numpy as np
 import torch
 import pickle
 import ccxt
+import ta
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -103,7 +104,7 @@ class LiveTradingBot:
         try:
             # Load LSTM model
             checkpoint = torch.load(model_path, map_location=torch.device('cpu'))
-            if hasattr(checkpoint, 'module'):
+            if hasattr(checkpoint, 'module_'):
                 self.model = checkpoint.module_
             else:
                 self.model = checkpoint
@@ -130,10 +131,10 @@ class LiveTradingBot:
     def get_market_data(self):
         """Get current market data from BingX using CCXT"""
         try:
-            # Get recent klines (1m interval, last 100 candles)
+            # Get recent klines (1m interval, need at least 300 for indicators)
             # CCXT uses 'BTC/USDT' format
             symbol_ccxt = self.symbol.replace('-', '/')
-            klines = self.exchange.fetch_ohlcv(symbol_ccxt, timeframe='1m', limit=100)
+            klines = self.exchange.fetch_ohlcv(symbol_ccxt, timeframe='1m', limit=350)
 
             if not klines:
                 logger.warning("No kline data received")
@@ -168,8 +169,31 @@ class LiveTradingBot:
     def calculate_indicators(self, df):
         """Calculate technical indicators matching feature_engineer.py"""
         try:
-            # Use last 50 candles for indicator calculation (same as feature_engineer.py)
-            data = df.tail(50).copy()
+            # Validate minimum data requirements
+            min_candles = len(df)
+            logger.info(f"Available candles: {min_candles}")
+
+            # Define minimum requirements for different indicator types
+            requirements = {
+                'critical': 15,    # Basic indicators (RSI_15, ATR_15, BB_15, etc.)
+                'moderate': 60,    # Medium-term indicators (RSI_60, ATR_60, BB_60, etc.)
+                'long_term': 300   # Long-term indicators (EMA_300, BB_300, RSI_300, etc.)
+            }
+
+            # Check if we have minimum viable data
+            if min_candles < requirements['critical']:
+                logger.error(f"CRITICAL: Insufficient data for basic indicators. Need at least {requirements['critical']} candles, got {min_candles}")
+                return None
+
+            # Log warnings for different data levels
+            if min_candles < requirements['moderate']:
+                logger.warning(f"WARNING: Limited data ({min_candles} candles). Medium-term indicators may be inaccurate.")
+            if min_candles < requirements['long_term']:
+                logger.warning(f"WARNING: Insufficient data for long-term indicators ({min_candles} < {requirements['long_term']} candles). EMA_300, BB_300, RSI_300, VAR_300, MFI_300 will be less reliable.")
+
+            # Use all available data (need at least 300 for some indicators)
+            # feature_engineer.py uses window_size=50 for overlap, but we need full history
+            data = df.copy()
 
             # Basic price data
             close = data['close']
@@ -180,52 +204,123 @@ class LiveTradingBot:
             # Calculate indicators (same as feature_engineer.py)
             indicators = {}
 
+            # Helper function to safely get last value
+            def safe_last_value(series, name):
+                try:
+                    value = series.iloc[-1]
+                    if pd.isna(value) or np.isinf(value):
+                        logger.warning(f"Invalid value for {name}: {value}")
+                        return 0.0  # Default fallback
+                    return float(value)
+                except (IndexError, TypeError) as e:
+                    logger.warning(f"Could not calculate {name}: {e}")
+                    return 0.0
+
             # EMA indicators
-            indicators['EMA_15'] = close.ewm(span=15, adjust=False).mean().iloc[-1]
-            indicators['EMA_60'] = close.ewm(span=60, adjust=False).mean().iloc[-1]
-            indicators['EMA_300'] = close.ewm(span=300, adjust=False).mean().iloc[-1]
+            indicators['EMA_15'] = safe_last_value(close.ewm(span=15, adjust=False).mean(), 'EMA_15')
+            indicators['EMA_60'] = safe_last_value(close.ewm(span=60, adjust=False).mean(), 'EMA_60')
+            indicators['EMA_300'] = safe_last_value(close.ewm(span=300, adjust=False).mean(), 'EMA_300')
 
             # Bollinger Bands
             for window in [15, 60, 300]:
-                sma = close.rolling(window=window).mean()
-                std = close.rolling(window=window).std()
-                indicators[f'BB_{window}_upper'] = (sma + 2*std).iloc[-1]
-                indicators[f'BB_{window}_lower'] = (sma - 2*std).iloc[-1]
+                if len(close) >= window:
+                    sma = close.rolling(window=window).mean()
+                    std = close.rolling(window=window).std()
+                    indicators[f'BB_{window}_upper'] = safe_last_value(sma + 2*std, f'BB_{window}_upper')
+                    indicators[f'BB_{window}_lower'] = safe_last_value(sma - 2*std, f'BB_{window}_lower')
+                else:
+                    logger.warning(f"Insufficient data for BB_{window} (need {window}, got {len(close)})")
+                    indicators[f'BB_{window}_upper'] = close.iloc[-1]  # Fallback to current price
+                    indicators[f'BB_{window}_lower'] = close.iloc[-1]
 
             # RSI indicators
             for window in [15, 60, 300]:
-                delta = close.diff()
-                up = delta.clip(lower=0)
-                down = -1 * delta.clip(upper=0)
-                ma_up = up.rolling(window=window).mean()
-                ma_down = down.rolling(window=window).mean()
-                rsi = 100 - (100 / (1 + ma_up / ma_down))
-                indicators[f'RSI_{window}'] = rsi.iloc[-1]
+                if len(close) >= window + 1:  # Need extra candle for diff
+                    delta = close.diff()
+                    up = delta.clip(lower=0)
+                    down = -1 * delta.clip(upper=0)
+                    ma_up = up.rolling(window=window).mean()
+                    ma_down = down.rolling(window=window).mean()
+                    rsi = 100 - (100 / (1 + ma_up / ma_down))
+                    indicators[f'RSI_{window}'] = safe_last_value(rsi, f'RSI_{window}')
+                else:
+                    logger.warning(f"Insufficient data for RSI_{window} (need {window+1}, got {len(close)})")
+                    indicators[f'RSI_{window}'] = 50.0  # Neutral RSI
 
-            # Ultimate Oscillator
-            indicators['ULTOSC'] = ta.momentum.UltimateOscillator(high, low, close).ultimate_oscillator().iloc[-1]
+            # Ultimate Oscillator (requires at least 28 periods)
+            if len(data) >= 28:
+                try:
+                    indicators['ULTOSC'] = safe_last_value(
+                        ta.momentum.UltimateOscillator(high, low, close).ultimate_oscillator(),
+                        'ULTOSC'
+                    )
+                except Exception as e:
+                    logger.warning(f"Error calculating ULTOSC: {e}")
+                    indicators['ULTOSC'] = 50.0
+            else:
+                logger.warning(f"Insufficient data for ULTOSC (need 28, got {len(data)})")
+                indicators['ULTOSC'] = 50.0
 
             # Volume indicators
-            indicators['OBV'] = ta.volume.OnBalanceVolumeIndicator(close, volume).on_balance_volume().iloc[-1]
-            indicators['AD'] = ta.volume.AccDistIndexIndicator(high, low, close, volume).acc_dist_index().iloc[-1]
+            try:
+                indicators['OBV'] = safe_last_value(
+                    ta.volume.OnBalanceVolumeIndicator(close, volume).on_balance_volume(),
+                    'OBV'
+                )
+            except Exception as e:
+                logger.warning(f"Error calculating OBV: {e}")
+                indicators['OBV'] = 0.0
+
+            try:
+                indicators['AD'] = safe_last_value(
+                    ta.volume.AccDistIndexIndicator(high, low, close, volume).acc_dist_index(),
+                    'AD'
+                )
+            except Exception as e:
+                logger.warning(f"Error calculating AD: {e}")
+                indicators['AD'] = 0.0
 
             # ATR indicators
-            indicators['ATR_15'] = ta.volatility.AverageTrueRange(high, low, close, window=15).average_true_range().iloc[-1]
-            indicators['ATR_60'] = ta.volatility.AverageTrueRange(high, low, close, window=60).average_true_range().iloc[-1]
+            for window in [15, 60]:
+                if len(data) >= window + 1:
+                    try:
+                        indicators[f'ATR_{window}'] = safe_last_value(
+                            ta.volatility.AverageTrueRange(high, low, close, window=window).average_true_range(),
+                            f'ATR_{window}'
+                        )
+                    except Exception as e:
+                        logger.warning(f"Error calculating ATR_{window}: {e}")
+                        indicators[f'ATR_{window}'] = close.iloc[-1] * 0.01  # 1% of price as fallback
+                else:
+                    logger.warning(f"Insufficient data for ATR_{window} (need {window+1}, got {len(data)})")
+                    indicators[f'ATR_{window}'] = close.iloc[-1] * 0.01
 
             # Price Transform
-            indicators['WCLPRICE'] = (high + low + 2 * close) / 4
-            indicators['WCLPRICE'] = indicators['WCLPRICE'].iloc[-1]
+            wclprice = (high + low + 2 * close) / 4
+            indicators['WCLPRICE'] = safe_last_value(wclprice, 'WCLPRICE')
 
             # Statistical indicators (Variance)
-            indicators['VAR_15'] = close.rolling(window=15).var().iloc[-1]
-            indicators['VAR_60'] = close.rolling(window=60).var().iloc[-1]
-            indicators['VAR_300'] = close.rolling(window=300).var().iloc[-1]
+            for window in [15, 60, 300]:
+                if len(close) >= window:
+                    indicators[f'VAR_{window}'] = safe_last_value(close.rolling(window=window).var(), f'VAR_{window}')
+                else:
+                    logger.warning(f"Insufficient data for VAR_{window} (need {window}, got {len(close)})")
+                    indicators[f'VAR_{window}'] = close.var() if len(close) > 1 else 0.0
 
             # MFI indicators
-            indicators['MFI_15'] = ta.volume.MFIIndicator(high, low, close, volume, window=15).money_flow_index().iloc[-1]
-            indicators['MFI_60'] = ta.volume.MFIIndicator(high, low, close, volume, window=60).money_flow_index().iloc[-1]
-            indicators['MFI_300'] = ta.volume.MFIIndicator(high, low, close, volume, window=300).money_flow_index().iloc[-1]
+            for window in [15, 60, 300]:
+                if len(data) >= window:
+                    try:
+                        indicators[f'MFI_{window}'] = safe_last_value(
+                            ta.volume.MFIIndicator(high, low, close, volume, window=window).money_flow_index(),
+                            f'MFI_{window}'
+                        )
+                    except Exception as e:
+                        logger.warning(f"Error calculating MFI_{window}: {e}")
+                        indicators[f'MFI_{window}'] = 50.0  # Neutral MFI
+                else:
+                    logger.warning(f"Insufficient data for MFI_{window} (need {window}, got {len(data)})")
+                    indicators[f'MFI_{window}'] = 50.0
 
             return indicators
 

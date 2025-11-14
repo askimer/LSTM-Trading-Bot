@@ -27,22 +27,48 @@ best_model.eval()
 
 # load completely new test data
 df = pd.read_csv('./paper_trade_data/full_btc_usdt_data_feature_engineered.csv')
-df = df.dropna()
 
-# remove constant columns
+# Validate data
+print(f"Loaded {len(df)} rows of data")
+if df.empty:
+    raise ValueError("No data found in paper_trade_data/full_btc_usdt_data_feature_engineered.csv")
+
+# Check for required columns
+required_columns = ['close', 'ATR_15', 'RSI_15']
+missing_columns = [col for col in required_columns if col not in df.columns]
+if missing_columns:
+    raise ValueError(f"Missing required columns: {missing_columns}")
+
+# Clean data
+df = df.dropna()
+print(f"After dropping NaN: {len(df)} rows")
+
+if df.empty:
+    raise ValueError("All data was removed after dropping NaN values")
+
+# Check for constant columns
 std_dev = df.std()
+constant_columns = std_dev[std_dev == 0].index.tolist()
+if constant_columns:
+    print(f"Warning: Found constant columns: {constant_columns}")
+
 non_constant_columns = std_dev[std_dev != 0].index.tolist()
 df = df[non_constant_columns]
 
+print(f"Final dataset: {len(df)} rows, {len(df.columns)} features")
+
 # scale the data
-X = df.drop('Close', axis=1).values
-y = df['Close'].values.reshape(-1, 1)
+X = df.drop('close', axis=1).values
+y = df['close'].values.reshape(-1, 1)
 
-# open the scaler
-with open('scaler.pkl', 'rb') as f:
-    scaler = pickle.load(f)
+# open the scalers (separate for X and y)
+with open('scaler_X.pkl', 'rb') as f:
+    scaler_X = pickle.load(f)
 
-X = scaler.transform(X)
+with open('scaler_y.pkl', 'rb') as f:
+    scaler_y = pickle.load(f)
+
+X = scaler_X.transform(X)
 
 def calculate_past_average(predictions, window):
     if len(predictions) < window:
@@ -84,8 +110,9 @@ def run_simulation(alpha_atr, alpha_rsi, base_sell_threshold, base_buy_threshold
         sell_threshold = base_sell_threshold + alpha_atr * atr_value + alpha_rsi * max(0, rsi_value - 70)
         buy_threshold = base_buy_threshold - alpha_atr * atr_value - alpha_rsi * max(0, 70 - rsi_value)
 
-        # predictions
-        prediction = best_model(input_data).item()
+        # predictions (model outputs scaled values, need to inverse transform)
+        prediction_scaled = best_model(input_data).item()
+        prediction = scaler_y.inverse_transform([[prediction_scaled]])[0][0]
 
         past_predictions.append(prediction)
         past_average = calculate_past_average(past_predictions, window=window_size)
@@ -93,7 +120,7 @@ def run_simulation(alpha_atr, alpha_rsi, base_sell_threshold, base_buy_threshold
         trend_direction = 'up' if prediction > past_average else 'down'
         # positive -> probably going up
         # negative -> probably going down
-        confidence = (prediction - past_average) / past_average
+        confidence = (prediction - past_average) / past_average if past_average != 0 else 0
 
         asset_price = y[i][0]
 
@@ -187,9 +214,9 @@ profit, sharpe, drawdown = run_simulation(alpha_atr, alpha_rsi, base_sell_thresh
 # compare with buy and hold
 # search for the earliest price
 earliest_time = df['Open time'].iloc[0]
-earliest_price = df['Close'].iloc[0]
+earliest_price = df['close'].iloc[0]
 latest_time = df['Open time'].iloc[-1]
-latest_price = df['Close'].iloc[-1]
+latest_price = df['close'].iloc[-1]
 
 print(f"Earliest time: {earliest_time}, Earliest price: {earliest_price}")
 print(f"Latest time: {latest_time}, Latest price: {latest_price}")
@@ -201,8 +228,8 @@ print("Buy and hold strategy")
 print(f"Initial Budget: {initial_budget}, Final Total Value: {total_value}")
 print(f"Total Profit: {total_value - initial_budget}")
 
-# calculate the sharpe ratio using df['Close']
-# calculate the max drawdown using df['Close']
+# calculate the sharpe ratio using df['close']
+# calculate the max drawdown using df['close']
 portfolio_values = []
 current_budget = initial_budget
 assets_held = 0
