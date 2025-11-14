@@ -15,6 +15,7 @@ import matplotlib.pyplot as plt
 
 import pickle
 import resource
+import time
 
 # Define the LSTM model using PyTorch
 class LSTMRegressor(nn.Module):
@@ -28,6 +29,67 @@ class LSTMRegressor(nn.Module):
         predictions = self.linear(lstm_out[:, -1])
         return predictions
     
+class ProgressNeuralNetRegressor(NeuralNetRegressor):
+    """NeuralNetRegressor with progress tracking"""
+
+    def __init__(self, iteration=1, total_iterations=20, **kwargs):
+        super().__init__(**kwargs)
+        # Replace the default callback with our custom one
+        self.callbacks_ = [
+            cb for cb in self.callbacks
+            if not isinstance(cb, TrainingProgressCallback)
+        ]
+        self.callbacks_.append(TrainingProgressCallback(
+            total_iterations=total_iterations,
+            current_iteration=iteration
+        ))
+
+class TrainingProgressCallback(Callback):
+    """Custom callback to show detailed training progress"""
+
+    def __init__(self, total_iterations=20, current_iteration=1):
+        self.total_iterations = total_iterations
+        self.current_iteration = current_iteration
+        self.start_time = None
+
+    def on_train_begin(self, net, X, y):
+        self.start_time = time.time()
+        print(f"\n🔄 Iteration {self.current_iteration}/{self.total_iterations}")
+        print("=" * 50)
+
+    def on_epoch_end(self, net, dataset_train, dataset_valid, **kwargs):
+        epoch = net.history[-1]['epoch']
+        train_loss = net.history[-1]['train_loss']
+        valid_loss = net.history[-1].get('valid_loss', 'N/A')
+
+        # Calculate ETA
+        elapsed = time.time() - self.start_time
+        epochs_done = len(net.history)
+        if epochs_done > 0:
+            avg_epoch_time = elapsed / epochs_done
+            remaining_epochs = net.max_epochs - epochs_done
+            eta = avg_epoch_time * remaining_epochs
+            eta_str = f"{eta/60:.1f}min" if eta > 60 else f"{eta:.1f}s"
+        else:
+            eta_str = "N/A"
+
+        print(f"📈 Epoch {epoch:2d}/{net.max_epochs} | Train Loss: {train_loss:.6f} | Valid Loss: {valid_loss} | ETA: {eta_str}")
+
+        # Show progress bar
+        progress = int(30 * epoch / net.max_epochs)
+        bar = "█" * progress + "░" * (30 - progress)
+        print(f"[{bar}] {epoch/net.max_epochs*100:.1f}%")
+
+    def on_train_end(self, net, X, y):
+        final_train_loss = net.history[-1]['train_loss']
+        final_valid_loss = net.history[-1].get('valid_loss', 'N/A')
+        total_time = time.time() - self.start_time
+
+        print(f"\n✅ Iteration {self.current_iteration} completed in {total_time:.1f}s")
+        print(f"   Final Train Loss: {final_train_loss:.6f}")
+        print(f"   Final Valid Loss: {final_valid_loss}")
+        print("-" * 50)
+
 early_stopping = EarlyStopping(
     monitor='valid_loss',
     patience=5,
@@ -96,19 +158,30 @@ if __name__ == "__main__":
     train_dataset = TensorDataset(X_train_tensor, y_train_tensor)
     test_dataset = TensorDataset(X_test_tensor, y_test_tensor)
 
-    net = NeuralNetRegressor(
-        module=LSTMRegressor,
-        module__input_dim=n_features,
-        module__hidden_dim=50,  # default value
-        module__num_layers=1,   # default value
-        criterion=nn.MSELoss,
-        optimizer=torch.optim.Adam,
-        lr=0.001,              # default learning rate
-        batch_size=64,         # default batch size
-        max_epochs=10,         # default number of epochs
-        iterator_train__shuffle=True,
-        device=device,
-        callbacks=[early_stopping]
+    # Create base network template
+    def create_net(**kwargs):
+        """Create NeuralNetRegressor with custom progress callback"""
+        iteration = kwargs.pop('iteration', 1)
+        return NeuralNetRegressor(
+            module=LSTMRegressor,
+            module__input_dim=n_features,
+            criterion=nn.MSELoss,
+            optimizer=torch.optim.Adam,
+            iterator_train__shuffle=True,
+            device=device,
+            callbacks=[
+                early_stopping,
+                TrainingProgressCallback(total_iterations=20, current_iteration=iteration)
+            ],
+            **kwargs
+        )
+
+    net = create_net(
+        module__hidden_dim=50,
+        module__num_layers=1,
+        lr=0.001,
+        batch_size=64,
+        max_epochs=10
     )
 
     # Define the hyperparameters grid to search
@@ -121,21 +194,55 @@ if __name__ == "__main__":
     }
 
     print("Searching for optimal hyperparameters...")
-    # Create the RandomizedSearchCV object
-    random_search = RandomizedSearchCV(net, params, n_iter=20, cv=3, scoring='neg_mean_squared_error', n_jobs=2, random_state=42, verbose=2)
+    print("=" * 60)
 
-    print("Training model...")
-    # Fit the model
-    random_search.fit(X_train_tensor, y_train_tensor)
+    # Custom hyperparameter search with progress tracking
+    best_score = float('-inf')
+    best_params = None
+    best_model = None
 
-    print("Get best params")
-    best_params = random_search.best_params_
+    # Sample parameter combinations
+    np.random.seed(42)
+    param_combinations = []
+    for _ in range(20):
+        combination = {}
+        for param_name, param_values in params.items():
+            combination[param_name] = np.random.choice(param_values)
+        param_combinations.append(combination)
+
+    for i, param_comb in enumerate(param_combinations, 1):
+        print(f"\n🎯 Testing combination {i}/20:")
+        for param_name, param_value in param_comb.items():
+            print(f"   {param_name}: {param_value}")
+
+        # Create model with progress tracking
+        model = create_net(iteration=i, **param_comb)
+
+        try:
+            # Train model
+            model.fit(X_train_tensor, y_train_tensor)
+
+            # Evaluate on validation set (simple holdout for speed)
+            y_pred = model.predict(X_test_tensor)
+            score = -mean_squared_error(y_test_tensor, y_pred)  # Negative MSE
+
+            print(f"   📊 Validation Score: {score:.6f}")
+
+            if score > best_score:
+                best_score = score
+                best_params = param_comb.copy()
+                best_model = model
+                print(f"   🏆 New best score: {best_score:.6f}")
+
+        except Exception as e:
+            print(f"   ❌ Error training model: {e}")
+            continue
+
+    print(f"\n🏁 Hyperparameter search completed!")
+    print(f"Best score: {best_score:.6f}")
     print("Best hyperparameters:")
     for param_name, param_value in best_params.items():
-        print(f"{param_name}: {param_value}")
-
-    # Get the best model
-    best_model = random_search.best_estimator_
+        print(f"  {param_name}: {param_value}")
 
     print("Evaluating model...")
     # Make predictions
