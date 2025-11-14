@@ -226,6 +226,15 @@ class RLLiveTradingBot:
         self.entry_price = 0
         self.total_fees = 0
 
+        # Trailing stop-loss and take-profit tracking
+        self.trailing_stop_loss = 0
+        self.trailing_take_profit = 0
+        self.highest_price_since_entry = 0
+        self.lowest_price_since_entry = float('inf')
+        self.stop_loss_pct = 0.05  # 5% stop loss
+        self.take_profit_pct = 0.10  # 10% take profit
+        self.trailing_stop_distance = 0.03  # 3% trailing distance
+
         # Trading history
         self.trades = []
         self.portfolio_history = []
@@ -596,6 +605,74 @@ class RLLiveTradingBot:
                     logger.warning("Could not calculate indicators, skipping iteration")
                     time.sleep(60)
                     continue
+
+                # Update trailing levels if we have a position
+                if self.position > 0:
+                    # Update highest price since entry
+                    if current_price > self.highest_price_since_entry:
+                        self.highest_price_since_entry = current_price
+
+                        # Update trailing stop-loss (3% below highest price)
+                        self.trailing_stop_loss = self.highest_price_since_entry * (1 - self.trailing_stop_distance)
+
+                        # Update trailing take-profit (10% above entry, but trails with price)
+                        self.trailing_take_profit = max(self.trailing_take_profit,
+                                                      self.entry_price * (1 + self.take_profit_pct),
+                                                      self.highest_price_since_entry * 0.95)  # At least 5% profit
+
+                # Check for stop-loss or take-profit triggers
+                stop_loss_triggered = False
+                take_profit_triggered = False
+
+                if self.position > 0:
+                    # Check stop-loss
+                    if current_price <= self.trailing_stop_loss:
+                        stop_loss_triggered = True
+                        logger.info(f"🛑 STOP-LOSS triggered at ${current_price:.2f} (trailing: ${self.trailing_stop_loss:.2f})")
+
+                    # Check take-profit
+                    elif current_price >= self.trailing_take_profit:
+                        take_profit_triggered = True
+                        logger.info(f"💰 TAKE-PROFIT triggered at ${current_price:.2f} (trailing: ${self.trailing_take_profit:.2f})")
+
+                # Force sell if stop-loss or take-profit triggered
+                if stop_loss_triggered or take_profit_triggered:
+                    if self.position > 0:
+                        revenue = self.position * current_price
+                        fee = revenue * 0.0018
+                        revenue_after_fee = revenue - fee
+
+                        pnl = (current_price - self.entry_price) * self.position - fee
+
+                        self.balance += revenue_after_fee
+                        self.total_fees += fee
+
+                        trigger_type = "STOP-LOSS" if stop_loss_triggered else "TAKE-PROFIT"
+
+                        trade = {
+                            'timestamp': datetime.now(),
+                            'type': f'FORCE_SELL_{trigger_type}',
+                            'price': current_price,
+                            'amount': self.position,
+                            'value': revenue_after_fee,
+                            'fee': fee,
+                            'pnl': pnl,
+                            'trigger_price': self.trailing_stop_loss if stop_loss_triggered else self.trailing_take_profit,
+                            'balance_after': self.balance,
+                            'position_after': 0
+                        }
+
+                        self.trades.append(trade)
+
+                        self.position = 0
+                        self.entry_price = 0
+                        self.trailing_stop_loss = 0
+                        self.trailing_take_profit = 0
+                        self.highest_price_since_entry = 0
+                        self.lowest_price_since_entry = float('inf')
+
+                        trade_executed = True
+                        continue  # Skip normal RL action this step
 
                 # Create RL state
                 state = self.get_rl_state(indicators, current_price)

@@ -224,6 +224,15 @@ def run_rl_paper_trading(model_path, data_path, initial_balance=10000):
     total_fees = 0
     entry_price = 0
 
+    # Trailing stop-loss and take-profit tracking
+    trailing_stop_loss = 0
+    trailing_take_profit = 0
+    highest_price_since_entry = 0
+    lowest_price_since_entry = float('inf')
+    stop_loss_pct = 0.05  # 5% stop loss
+    take_profit_pct = 0.10  # 10% take profit
+    trailing_stop_distance = 0.03  # 3% trailing distance
+
     state, _ = env.reset()
     done = False
     step_count = 0
@@ -240,6 +249,70 @@ def run_rl_paper_trading(model_path, data_path, initial_balance=10000):
 
         # Get current market data
         current_price = df.iloc[min(env.current_step, len(df)-1)].get('close', df.iloc[min(env.current_step, len(df)-1)].get('Close'))
+
+        # Update trailing levels if we have a position
+        if position > 0:
+            # Update highest price since entry
+            if current_price > highest_price_since_entry:
+                highest_price_since_entry = current_price
+
+                # Update trailing stop-loss (3% below highest price)
+                trailing_stop_loss = highest_price_since_entry * (1 - trailing_stop_distance)
+
+                # Update trailing take-profit (10% above entry, but trails with price)
+                trailing_take_profit = max(trailing_take_profit,
+                                         entry_price * (1 + take_profit_pct),
+                                         highest_price_since_entry * 0.95)  # At least 5% profit
+
+        # Check for stop-loss or take-profit triggers
+        stop_loss_triggered = False
+        take_profit_triggered = False
+
+        if position > 0:
+            # Check stop-loss
+            if current_price <= trailing_stop_loss:
+                stop_loss_triggered = True
+                print(f"🛑 STOP-LOSS triggered at ${current_price:.2f} (trailing: ${trailing_stop_loss:.2f})")
+
+            # Check take-profit
+            elif current_price >= trailing_take_profit:
+                take_profit_triggered = True
+                print(f"💰 TAKE-PROFIT triggered at ${current_price:.2f} (trailing: ${trailing_take_profit:.2f})")
+
+        # Force sell if stop-loss or take-profit triggered
+        if stop_loss_triggered or take_profit_triggered:
+            if position > 0:
+                revenue = position * current_price
+                fee = revenue * 0.0018
+                revenue_after_fee = revenue - fee
+
+                pnl = (current_price - entry_price) * position - fee
+
+                balance += revenue_after_fee
+                total_fees += fee
+
+                trigger_type = "STOP-LOSS" if stop_loss_triggered else "TAKE-PROFIT"
+
+                trades.append({
+                    'step': step_count,
+                    'type': f'FORCE_SELL_{trigger_type}',
+                    'price': current_price,
+                    'amount': position,
+                    'value': revenue_after_fee,
+                    'fee': fee,
+                    'pnl': pnl,
+                    'trigger_price': trailing_stop_loss if stop_loss_triggered else trailing_take_profit
+                })
+
+                position = 0
+                entry_price = 0
+                trailing_stop_loss = 0
+                trailing_take_profit = 0
+                highest_price_since_entry = 0
+                lowest_price_since_entry = float('inf')
+
+                trade_executed = True
+                continue  # Skip normal RL action this step
 
         # Execute trade logic (simplified version)
         trade_executed = False
@@ -396,6 +469,20 @@ def run_rl_paper_trading(model_path, data_path, initial_balance=10000):
         sell_steps = [t['step'] for t in sell_trades]
         sell_prices = [t['price'] for t in sell_trades]
         plt.scatter(sell_steps, sell_prices, color='red', marker='v', s=50, label='Sell')
+
+    # Add stop-loss and take-profit markers
+    stop_loss_trades = [t for t in trades if 'STOP-LOSS' in t.get('type', '')]
+    take_profit_trades = [t for t in trades if 'TAKE-PROFIT' in t.get('type', '')]
+
+    if stop_loss_trades:
+        sl_steps = [t['step'] for t in stop_loss_trades]
+        sl_prices = [t['price'] for t in stop_loss_trades]
+        plt.scatter(sl_steps, sl_prices, color='darkred', marker='X', s=80, label='Stop-Loss')
+
+    if take_profit_trades:
+        tp_steps = [t['step'] for t in take_profit_trades]
+        tp_prices = [t['price'] for t in take_profit_trades]
+        plt.scatter(tp_steps, tp_prices, color='darkgreen', marker='P', s=80, label='Take-Profit')
 
     plt.title('Trading Actions on Price Chart')
     plt.xlabel('Steps')
