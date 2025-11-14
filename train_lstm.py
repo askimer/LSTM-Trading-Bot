@@ -56,7 +56,7 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Training on device {device}.")
     print("Loading data...")
-    df = pd.read_csv('./btc_usdt_data/full_btc_usdt_data_feature_engineered.csv')
+    df = pd.read_csv('./btc_usdt_training_data/full_btc_usdt_data_feature_engineered.csv')
     df = df.dropna()
 
     print("Removing constant columns...")
@@ -141,9 +141,11 @@ if __name__ == "__main__":
     # Make predictions
     y_pred = best_model.predict(X_test_tensor)
 
-    # Calculate MSE
-    mse = mean_squared_error(y_test_tensor, y_pred)
-    print(f"Mean Squared Error: {mse}")
+    # Calculate MSE on original scale (not scaled)
+    y_pred_rescaled = scaler_y.inverse_transform(y_pred.reshape(-1, 1))
+    y_test_rescaled = scaler_y.inverse_transform(y_test_tensor.numpy())
+    mse = mean_squared_error(y_test_rescaled, y_pred_rescaled)
+    print(f"Mean Squared Error (on original scale): {mse}")
 
     history = best_model.history
 

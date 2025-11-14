@@ -39,7 +39,7 @@ def run_script(script_name):
         print(f"Error running {script_name}:")
         print(result.stderr)
         sys.exit(1)
-    # Print the output of the scri/Volumes/Movies/PYTHON/LSTM-Algorithmic-Trading-Bot/btc_usdt_training_data/btc_usdt_data/Volumes/Movies/PYTHON/LSTM-Algorithmic-Trading-Bot/btc_usdt_training_data/btc_usdt_datapt
+    # Print the output of the script
     if result.stdout:
         print(result.stdout.strip())
     print(f"{script_name} completed successfully.")
@@ -175,6 +175,18 @@ def modify_paper_trading_model(model_file):
         f.write(content)
     print(f"Modified paper_trading.py to use model {model_file}")
 
+def tune_strategy_step():
+    """Execute tune trading strategy step."""
+    model_file = find_latest_model()
+    modify_strategy_tuning_model(model_file)
+    run_script('strategy_tuning.py')
+
+def paper_trading_step():
+    """Execute paper trading step."""
+    model_file = find_latest_model()
+    modify_paper_trading_model(model_file)
+    run_script('paper_trading.py')
+
 def main(start_from=1):
     model_type = "RL" if args.rl else "LSTM"
     print(f"Starting {model_type} Algorithmic Trading Bot Pipeline")
@@ -199,16 +211,8 @@ def main(start_from=1):
             modify_paper_trading()
         )),
         4: ("Train Model", lambda: run_script('train_rl.py' if args.rl else 'train_lstm.py')),
-        5: ("Tune Trading Strategy", lambda: (
-            model_file := find_latest_model(),
-            modify_strategy_tuning_model(model_file),
-            run_script('strategy_tuning.py')
-        )),
-        6: ("Paper Trading", lambda: (
-            model_file := find_latest_model(),
-            modify_paper_trading_model(model_file),
-            run_script('paper_trading.py')
-        )),
+        5: ("Tune Trading Strategy", tune_strategy_step),
+        6: ("Paper Trading", paper_trading_step),
         7: ("Live Trading (Virtual)", lambda: run_script('live_trading.py')),
     }
 

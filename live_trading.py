@@ -64,7 +64,7 @@ class LiveTradingBot:
             }
         })
 
-        # Load trained model and scaler
+        # Load trained model and scalers
         self.load_model(model_path, scaler_path)
 
         # Trading parameters (from paper trading optimization)
@@ -99,7 +99,7 @@ class LiveTradingBot:
         logger.info(f"Initial balance: {self.initial_balance} USDT")
 
     def load_model(self, model_path, scaler_path):
-        """Load trained LSTM model and scaler"""
+        """Load trained LSTM model and scalers"""
         try:
             # Load LSTM model
             checkpoint = torch.load(model_path, map_location=torch.device('cpu'))
@@ -111,13 +111,20 @@ class LiveTradingBot:
             self.model.eval()
             logger.info(f"Loaded model from {model_path}")
 
-            # Load scaler
-            with open(scaler_path, 'rb') as f:
-                self.scaler = pickle.load(f)
-            logger.info(f"Loaded scaler from {scaler_path}")
+            # Load scalers
+            scaler_X_path = scaler_path.replace('scaler.pkl', 'scaler_X.pkl')
+            scaler_y_path = scaler_path.replace('scaler.pkl', 'scaler_y.pkl')
+
+            with open(scaler_X_path, 'rb') as f:
+                self.scaler_X = pickle.load(f)
+            logger.info(f"Loaded scaler_X from {scaler_X_path}")
+
+            with open(scaler_y_path, 'rb') as f:
+                self.scaler_y = pickle.load(f)
+            logger.info(f"Loaded scaler_y from {scaler_y_path}")
 
         except Exception as e:
-            logger.error(f"Error loading model/scaler: {e}")
+            logger.error(f"Error loading model/scalers: {e}")
             raise
 
     def get_market_data(self):
@@ -159,102 +166,66 @@ class LiveTradingBot:
             return None
 
     def calculate_indicators(self, df):
-        """Calculate technical indicators for the latest data point"""
+        """Calculate technical indicators matching feature_engineer.py"""
         try:
-            # Use last 50 candles for indicator calculation
+            # Use last 50 candles for indicator calculation (same as feature_engineer.py)
             data = df.tail(50).copy()
 
             # Basic price data
-            close = data['close'].values
-            high = data['high'].values
-            low = data['low'].values
-            volume = data['volume'].values
+            close = data['close']
+            high = data['high']
+            low = data['low']
+            volume = data['volume']
 
-            # Calculate indicators (simplified versions)
+            # Calculate indicators (same as feature_engineer.py)
             indicators = {}
 
-            # RSI
-            def calculate_rsi(prices, period=14):
-                deltas = np.diff(prices)
-                seed = deltas[:period+1]
-                up = seed[seed >= 0].sum()/period
-                down = -seed[seed < 0].sum()/period
-                rs = up/down
-                rsi = np.zeros_like(prices)
-                rsi[:period] = 100. - 100./(1.+rs)
-
-                for i in range(period, len(prices)):
-                    delta = deltas[i-1]
-                    if delta > 0:
-                        upval = delta
-                        downval = 0.
-                    else:
-                        upval = 0.
-                        downval = -delta
-
-                    up = (up*(period-1) + upval)/period
-                    down = (down*(period-1) + downval)/period
-
-                    rs = up/down
-                    rsi[i] = 100. - 100./(1.+rs)
-                return rsi
-
-            indicators['RSI_15'] = calculate_rsi(close)[-1]
-
-            # ATR (simplified)
-            tr = np.maximum(high - low,
-                          np.maximum(np.abs(high - np.roll(close, 1)),
-                                   np.abs(low - np.roll(close, 1))))
-            indicators['ATR_15'] = np.mean(tr[-15:])
-
-            # MACD (simplified)
-            ema12 = pd.Series(close).ewm(span=12).mean()
-            ema26 = pd.Series(close).ewm(span=26).mean()
-            indicators['MACD_macd'] = (ema12 - ema26).iloc[-1]
+            # EMA indicators
+            indicators['EMA_15'] = close.ewm(span=15, adjust=False).mean().iloc[-1]
+            indicators['EMA_60'] = close.ewm(span=60, adjust=False).mean().iloc[-1]
+            indicators['EMA_300'] = close.ewm(span=300, adjust=False).mean().iloc[-1]
 
             # Bollinger Bands
-            sma20 = pd.Series(close).rolling(20).mean()
-            std20 = pd.Series(close).rolling(20).std()
-            indicators['BB_15_upper'] = (sma20 + 2*std20).iloc[-1]
-            indicators['BB_15_lower'] = (sma20 - 2*std20).iloc[-1]
+            for window in [15, 60, 300]:
+                sma = close.rolling(window=window).mean()
+                std = close.rolling(window=window).std()
+                indicators[f'BB_{window}_upper'] = (sma + 2*std).iloc[-1]
+                indicators[f'BB_{window}_lower'] = (sma - 2*std).iloc[-1]
 
-            # OBV
-            obv = np.zeros(len(close))
-            obv[0] = volume[0]
-            for i in range(1, len(close)):
-                if close[i] > close[i-1]:
-                    obv[i] = obv[i-1] + volume[i]
-                elif close[i] < close[i-1]:
-                    obv[i] = obv[i-1] - volume[i]
-                else:
-                    obv[i] = obv[i-1]
-            indicators['OBV'] = obv[-1]
+            # RSI indicators
+            for window in [15, 60, 300]:
+                delta = close.diff()
+                up = delta.clip(lower=0)
+                down = -1 * delta.clip(upper=0)
+                ma_up = up.rolling(window=window).mean()
+                ma_down = down.rolling(window=window).mean()
+                rsi = 100 - (100 / (1 + ma_up / ma_down))
+                indicators[f'RSI_{window}'] = rsi.iloc[-1]
 
-            # AD (Accumulation/Distribution)
-            ad = np.zeros(len(close))
-            for i in range(len(close)):
-                if high[i] != low[i]:
-                    ad[i] = ((close[i] - low[i]) - (high[i] - close[i])) / (high[i] - low[i]) * volume[i]
-                else:
-                    ad[i] = 0
-                if i > 0:
-                    ad[i] += ad[i-1]
-            indicators['AD'] = ad[-1]
+            # Ultimate Oscillator
+            indicators['ULTOSC'] = ta.momentum.UltimateOscillator(high, low, close).ultimate_oscillator().iloc[-1]
 
-            # MFI (Money Flow Index)
-            typical_price = (high + low + close) / 3
-            money_flow = typical_price * volume
-            positive_flow = np.where(typical_price > np.roll(typical_price, 1), money_flow, 0)
-            negative_flow = np.where(typical_price < np.roll(typical_price, 1), money_flow, 0)
+            # Volume indicators
+            indicators['OBV'] = ta.volume.OnBalanceVolumeIndicator(close, volume).on_balance_volume().iloc[-1]
+            indicators['AD'] = ta.volume.AccDistIndexIndicator(high, low, close, volume).acc_dist_index().iloc[-1]
 
-            positive_mf = np.sum(positive_flow[-14:])
-            negative_mf = np.sum(negative_flow[-14:])
+            # ATR indicators
+            indicators['ATR_15'] = ta.volatility.AverageTrueRange(high, low, close, window=15).average_true_range().iloc[-1]
+            indicators['ATR_60'] = ta.volatility.AverageTrueRange(high, low, close, window=60).average_true_range().iloc[-1]
 
-            if negative_mf != 0:
-                money_ratio = positive_mf / negative_mf
-                indicators['MFI_15'] = 100 - (100 / (1 + money_ratio))
-            else:
-                indicators['MFI_15'] = 100
+            # Price Transform
+            indicators['WCLPRICE'] = (high + low + 2 * close) / 4
+            indicators['WCLPRICE'] = indicators['WCLPRICE'].iloc[-1]
+
+            # Statistical indicators (Variance)
+            indicators['VAR_15'] = close.rolling(window=15).var().iloc[-1]
+            indicators['VAR_60'] = close.rolling(window=60).var().iloc[-1]
+            indicators['VAR_300'] = close.rolling(window=300).var().iloc[-1]
+
+            # MFI indicators
+            indicators['MFI_15'] = ta.volume.MFIIndicator(high, low, close, volume, window=15).money_flow_index().iloc[-1]
+            indicators['MFI_60'] = ta.volume.MFIIndicator(high, low, close, volume, window=60).money_flow_index().iloc[-1]
+            indicators['MFI_300'] = ta.volume.MFIIndicator(high, low, close, volume, window=300).money_flow_index().iloc[-1]
 
             return indicators
 
@@ -263,25 +234,35 @@ class LiveTradingBot:
             return None
 
     def predict_price(self, indicators):
-        """Use LSTM model to predict next price"""
+        """Use LSTM model to predict next price using all features from training"""
         try:
-            # Prepare features (same order as in training)
+            # Prepare features in the exact same order as feature_engineer.py
             feature_names = [
-                'RSI_15', 'MACD_macd', 'BB_15_upper', 'BB_15_lower',
-                'ATR_15', 'OBV', 'AD', 'MFI_15'
+                'EMA_15', 'EMA_60', 'EMA_300',
+                'BB_15_upper', 'BB_15_lower', 'BB_60_upper', 'BB_60_lower', 'BB_300_upper', 'BB_300_lower',
+                'RSI_15', 'RSI_60', 'RSI_300',
+                'ULTOSC',
+                'OBV', 'AD',
+                'ATR_15', 'ATR_60',
+                'WCLPRICE',
+                'VAR_15', 'VAR_60', 'VAR_300',
+                'MFI_15', 'MFI_60', 'MFI_300'
             ]
 
             features = np.array([indicators[name] for name in feature_names]).reshape(1, -1)
 
             # Scale features
-            features_scaled = self.scaler.transform(features)
+            features_scaled = self.scaler_X.transform(features)
 
             # Convert to tensor
             input_tensor = torch.tensor(features_scaled, dtype=torch.float32).unsqueeze(0)
 
             # Make prediction
             with torch.no_grad():
-                prediction = self.model(input_tensor).item()
+                prediction_scaled = self.model(input_tensor).item()
+
+            # Convert back to original scale
+            prediction = self.scaler_y.inverse_transform([[prediction_scaled]])[0][0]
 
             return prediction
 
