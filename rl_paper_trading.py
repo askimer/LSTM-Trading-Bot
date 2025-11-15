@@ -15,150 +15,8 @@ import pickle
 import time
 from datetime import datetime
 
-# Import TradingEnvironment from train_rl.py
-class TradingEnvironment(gym.Env):
-    """
-    Trading environment for RL agent (same as in train_rl.py)
-    """
-    def __init__(self, df, initial_balance=10000, transaction_fee=0.0018):
-        super(TradingEnvironment, self).__init__()
-
-        self.df = df.reset_index(drop=True)
-        self.initial_balance = initial_balance
-        self.transaction_fee = transaction_fee
-        self.current_step = 0
-
-        # Calculate dynamic price normalization based on data
-        price_col = 'close' if 'close' in df.columns else 'Close'
-        self.price_mean = df[price_col].mean()
-        self.price_std = df[price_col].std()
-
-        # Actions: 0=Hold, 1=Buy Long, 2=Sell Long, 3=Sell Short, 4=Buy Short
-        self.action_space = spaces.Discrete(5)
-
-        # State: [balance_norm, position_norm, price_norm, indicators...]
-        n_indicators = 7
-        self.observation_space = spaces.Box(
-            low=-np.inf, high=np.inf,
-            shape=(3 + n_indicators,), dtype=np.float32
-        )
-
-        self.reset()
-
-    def reset(self, seed=None, options=None):
-        self.current_step = 0
-        self.balance = self.initial_balance
-        self.position = 0
-        self.total_fees = 0
-        self.portfolio_values = [self.initial_balance]
-
-        return self._get_state(), {}
-
-    def _get_state(self):
-        """Get current state observation"""
-        if self.current_step >= len(self.df):
-            return np.zeros(self.observation_space.shape)
-
-        row = self.df.iloc[self.current_step]
-
-        # Normalize values
-        balance_norm = self.balance / self.initial_balance - 1
-        position_norm = self.position / (self.balance * 0.1) if self.balance > 0 else 0
-        current_price = row.get('close', row.get('Close', self.price_mean))
-        price_norm = (current_price - self.price_mean) / self.price_std
-
-        # Technical indicators
-        indicators = [
-            row.get('RSI_15', 50) / 100 - 0.5,
-            (row.get('BB_15_upper', current_price) / current_price - 1) if current_price > 0 else 0,
-            (row.get('BB_15_lower', current_price) / current_price - 1) if current_price > 0 else 0,
-            row.get('ATR_15', 100) / 1000,
-            row.get('OBV', 0) / 1e10,
-            row.get('AD', 0) / 1e10,
-            row.get('MFI_15', 50) / 100 - 0.5
-        ]
-
-        state = np.array([balance_norm, position_norm, price_norm] + indicators, dtype=np.float32)
-        return state
-
-    def step(self, action):
-        """Execute one step in environment"""
-        if self.current_step >= len(self.df) - 1:
-            terminated = True
-            truncated = False
-            reward = 0
-            return self._get_state(), reward, terminated, truncated, {}
-
-        current_price = self.df.iloc[self.current_step].get('close', self.df.iloc[self.current_step].get('Close'))
-        next_price = self.df.iloc[self.current_step + 1].get('close', self.df.iloc[self.current_step + 1].get('Close'))
-
-        reward = 0
-        terminated = False
-        truncated = False
-
-        # Execute action
-        if action == 1:  # Buy
-            if self.balance > current_price * (1 + self.transaction_fee):
-                invest_amount = min(self.balance * 0.1, self.balance - 100)
-                fee = invest_amount * self.transaction_fee
-                coins_bought = (invest_amount - fee) / current_price
-
-                self.position += coins_bought
-                self.balance -= invest_amount
-                self.total_fees += fee
-                reward -= 0.01
-
-        elif action == 2:  # Sell
-            if self.position > 0:
-                sell_amount = self.position * 0.5
-                revenue = sell_amount * current_price
-                fee = revenue * self.transaction_fee
-
-                self.position -= sell_amount
-                self.balance += revenue - fee
-                self.total_fees += fee
-                reward -= 0.01
-
-        # Calculate reward
-        current_portfolio = self.balance + self.position * current_price
-        next_portfolio = self.balance + self.position * next_price
-        portfolio_change = (next_portfolio - current_portfolio) / current_portfolio if current_portfolio > 0 else 0
-
-        if len(self.portfolio_values) >= 10:
-            recent_portfolio_values = self.portfolio_values[-10:]
-            returns = np.diff(recent_portfolio_values) / recent_portfolio_values[:-1]
-            volatility = np.std(returns) if len(returns) > 0 else 0
-            risk_penalty = volatility * 50
-        else:
-            risk_penalty = 0
-
-        reward += (portfolio_change * 10000) - risk_penalty
-
-        # Additional reward components
-        price_change_pct = (next_price - current_price) / current_price if current_price > 0 else 0
-
-        if action == 1 and price_change_pct > 0:
-            reward += abs(price_change_pct) * 1000
-        if action == 1 and price_change_pct < 0:
-            reward -= abs(price_change_pct) * 500
-        if action == 2 and price_change_pct < 0:
-            reward += abs(price_change_pct) * 1000
-        if action == 2 and price_change_pct > 0:
-            reward -= abs(price_change_pct) * 500
-
-        if action == 0 and self.position > 0:
-            reward -= 0.01
-
-        if current_portfolio < self.initial_balance * 0.5:
-            reward -= 10
-
-        self.portfolio_values.append(current_portfolio)
-        self.current_step += 1
-
-        if self.current_step >= len(self.df) - 1:
-            terminated = True
-
-        return self._get_state(), reward, terminated, truncated, {}
+# Import the latest TradingEnvironment from train_rl.py
+from train_rl import TradingEnvironment
 
 def calculate_sharpe_ratio(returns, risk_free_rate=0.000006811):
     """Calculate Sharpe ratio"""
@@ -461,8 +319,12 @@ def run_rl_paper_trading(model_path, data_path, initial_balance=10000):
     print(f"Sharpe Ratio:        {sharpe_ratio:.4f}")
     print(f"Max Drawdown:        {max_drawdown:.4f}")
     print(f"Total Trades:        {len(trades)}")
-    print(f"Buy Trades:          {len([t for t in trades if t['type'] == 'BUY'])}")
-    print(f"Sell Trades:         {len([t for t in trades if t['type'] == 'SELL'])}")
+    print(f"Buy Long Trades:     {len([t for t in trades if t['type'] == 'BUY_LONG'])}")
+    print(f"Sell Long Trades:    {len([t for t in trades if t['type'] == 'SELL_LONG'])}")
+    print(f"Sell Short Trades:   {len([t for t in trades if t['type'] == 'SELL_SHORT'])}")
+    print(f"Buy Short Trades:    {len([t for t in trades if t['type'] == 'BUY_SHORT'])}")
+    print(f"Stop-Loss Trades:    {len([t for t in trades if 'STOP-LOSS' in t.get('type', '')])}")
+    print(f"Take-Profit Trades:  {len([t for t in trades if 'TAKE-PROFIT' in t.get('type', '')])}")
     print(f"Total Fees:          ${total_fees:.2f}")
     print(f"Final Position:      {position:.6f} BTC")
     print(f"Final Balance:       ${balance:.2f}")
@@ -488,8 +350,8 @@ def run_rl_paper_trading(model_path, data_path, initial_balance=10000):
     plt.plot(steps, actions, 'o-', markersize=2)
     plt.title('RL Actions Over Time')
     plt.xlabel('Steps')
-    plt.ylabel('Action (0=Hold, 1=Buy, 2=Sell)')
-    plt.yticks([0, 1, 2], ['Hold', 'Buy', 'Sell'])
+    plt.ylabel('Action (0=Hold, 1=Buy Long, 2=Sell Long, 3=Sell Short, 4=Buy Short)')
+    plt.yticks([0, 1, 2, 3, 4], ['Hold', 'Buy Long', 'Sell Long', 'Sell Short', 'Buy Short'])
     plt.grid(True)
 
     # Price vs Portfolio
@@ -589,7 +451,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="RL Paper Trading Simulation")
     parser.add_argument("--model", default="ppo_trading_agent.zip",
                        help="Path to trained RL model")
-    parser.add_argument("--data", default="paper_trade_data/full_btc_usdt_data_feature_engineered.csv",
+    parser.add_argument("--data", default="btc_usdt_training_data/full_btc_usdt_data_feature_engineered.csv",
                        help="Path to historical data")
     parser.add_argument("--balance", type=float, default=10000,
                        help="Initial balance")
