@@ -67,9 +67,10 @@ def run_rl_paper_trading(model_path, data_path, initial_balance=10000):
         print(f"❌ Missing required columns: {missing_columns}")
         return None
 
-    # Initialize environment
+    # Initialize environment with same parameters as training
     print("Initializing trading environment...")
-    env = TradingEnvironment(df, initial_balance=initial_balance)
+    # Ensure same parameters as in train_rl.py
+    env = TradingEnvironment(df, initial_balance=initial_balance, transaction_fee=0.0018)
 
     # Trading simulation
     print("Starting trading simulation...")
@@ -77,29 +78,55 @@ def run_rl_paper_trading(model_path, data_path, initial_balance=10000):
 
     trades = []
     portfolio_history = []
-    balance = initial_balance
-    position = 0
-    total_fees = 0
-    entry_price = 0
-
-    # Trailing stop-loss and take-profit tracking
-    trailing_stop_loss = 0
-    trailing_take_profit = 0
-    highest_price_since_entry = 0
-    lowest_price_since_entry = float('inf')
-    stop_loss_pct = 0.05  # 5% stop loss
-    take_profit_pct = 0.10  # 10% take profit
-    trailing_stop_distance = 0.03  # 3% trailing distance
+    
+    # Use environment's state instead of separate variables
+    # This ensures synchronization with the environment
 
     state, _ = env.reset()
     done = False
     step_count = 0
+    action_counts = {0: 0, 1: 0, 2: 0, 3: 0, 4: 0}  # Track action distribution
 
     while not done:
         step_count += 1
 
+        # Save previous state BEFORE executing action
+        prev_position = env.position
+        prev_balance = env.balance
+        prev_entry_price = env.entry_price
+
         # Get action from RL model
         action, _ = model.predict(state, deterministic=True)
+        action = int(action)  # Ensure action is integer
+        
+        # Actions: 0=Hold, 1=Buy Long, 2=Sell Long (close long), 3=Sell Short (open short), 4=Buy Short (close short)
+        # Action 2 (Sell Long) requires an existing long position
+        # Action 3 (Sell Short) is for selling without position (opening short)
+        # WORKAROUND: If model incorrectly chooses action 2 without position, convert to action 3
+        # This is a temporary fix for a poorly trained model - should retrain with proper penalties
+        
+        original_action = action
+        if action == 2 and env.position == 0:
+            # Model incorrectly chose "Sell Long" without position
+            # Convert to action 3 (Sell Short) which is correct for selling without position
+            action = 3
+            if step_count <= 10:
+                print(f"  ⚠️ Model error corrected: Action 2→3 (Sell Long→Sell Short) at step {step_count}")
+                print(f"     Note: Action 2 = close long position, Action 3 = open short position (sell without position)")
+        
+        # Also handle action 4 (Buy Short/cover) when no short position exists
+        if action == 4 and env.position >= 0:
+            # Model incorrectly chose "Buy Short" (cover) without short position
+            # Convert to action 0 (Hold) as there's nothing to cover
+            if step_count <= 10:
+                print(f"  ⚠️ Model error corrected: Action 4→0 (Buy Short→Hold) at step {step_count} (no short to cover)")
+            action = 0
+        
+        action_counts[original_action] += 1  # Track original action for statistics
+        
+        # Debug: Print state and action every 1000 steps
+        if step_count % 1000 == 0 and step_count <= 2000:
+            print(f"  Debug Step {step_count}: state[0:3]={state[0:3]}, position={env.position:.6f}, action={action}")
 
         # Execute action in environment
         next_state, reward, terminated, truncated, _ = env.step(action)
@@ -108,186 +135,119 @@ def run_rl_paper_trading(model_path, data_path, initial_balance=10000):
         # Get current market data
         current_price = df.iloc[min(env.current_step, len(df)-1)].get('close', df.iloc[min(env.current_step, len(df)-1)].get('Close'))
 
-        # Update trailing levels if we have a position
-        if position > 0:
-            # Update highest price since entry
-            if current_price > highest_price_since_entry:
-                highest_price_since_entry = current_price
-
-                # Update trailing stop-loss (3% below highest price)
-                trailing_stop_loss = highest_price_since_entry * (1 - trailing_stop_distance)
-
-                # Update trailing take-profit (10% above entry, but trails with price)
-                trailing_take_profit = max(trailing_take_profit,
-                                         entry_price * (1 + take_profit_pct),
-                                         highest_price_since_entry * 0.95)  # At least 5% profit
-
-        # Check for stop-loss or take-profit triggers
-        stop_loss_triggered = False
-        take_profit_triggered = False
-
-        if position > 0:
-            # Check stop-loss
-            if current_price <= trailing_stop_loss:
-                stop_loss_triggered = True
-                print(f"🛑 STOP-LOSS triggered at ${current_price:.2f} (trailing: ${trailing_stop_loss:.2f})")
-
-            # Check take-profit
-            elif current_price >= trailing_take_profit:
-                take_profit_triggered = True
-                print(f"💰 TAKE-PROFIT triggered at ${current_price:.2f} (trailing: ${trailing_take_profit:.2f})")
-
-        # Force sell if stop-loss or take-profit triggered
-        if stop_loss_triggered or take_profit_triggered:
-            if position > 0:
-                revenue = position * current_price
-                fee = revenue * 0.0018
-                revenue_after_fee = revenue - fee
-
-                pnl = (current_price - entry_price) * position - fee
-
-                balance += revenue_after_fee
-                total_fees += fee
-
-                trigger_type = "STOP-LOSS" if stop_loss_triggered else "TAKE-PROFIT"
-
+        # Get new state AFTER executing action
+        new_position = env.position
+        new_balance = env.balance
+        new_entry_price = env.entry_price
+        
+        # Detect if a trade occurred by checking position or balance changes
+        position_changed = abs(new_position - prev_position) > 1e-8
+        balance_changed = abs(new_balance - prev_balance) > 0.01
+        
+        # Track trades that occurred in the environment
+        if position_changed or balance_changed:
+            # Determine trade type based on action and position change
+            if action == 1 and new_position > prev_position:  # Buy Long
+                btc_amount = new_position - prev_position
+                invest_amount = prev_balance - new_balance
+                fee = abs(invest_amount) * 0.0018 if invest_amount > 0 else 0
+                
                 trades.append({
                     'step': step_count,
-                    'type': f'FORCE_SELL_{trigger_type}',
+                    'type': 'BUY_LONG',
                     'price': current_price,
-                    'amount': position,
-                    'value': revenue_after_fee,
-                    'fee': fee,
-                    'pnl': pnl,
-                    'trigger_price': trailing_stop_loss if stop_loss_triggered else trailing_take_profit
+                    'amount': btc_amount,
+                    'value': abs(invest_amount),
+                    'fee': fee
                 })
-
-                position = 0
-                entry_price = 0
-                trailing_stop_loss = 0
-                trailing_take_profit = 0
-                highest_price_since_entry = 0
-                lowest_price_since_entry = float('inf')
-
-                trade_executed = True
-                continue  # Skip normal RL action this step
-
-        # Execute trade logic (updated for short positions)
-        trade_executed = False
-
-        if action == 1:  # Buy Long - открыть/добавить длинную позицию
-            if balance > current_price * 1.002:  # Account for fee
-                invest_amount = min(balance * 0.1, balance)  # Max 10% of balance
-                if invest_amount > 10:  # Minimum trade
-                    fee = invest_amount * 0.0018
-                    invest_after_fee = invest_amount - fee
-                    btc_amount = invest_after_fee / current_price
-
-                    position += btc_amount
-                    balance -= invest_amount
-                    total_fees += fee
-                    entry_price = current_price
-
+                
+            elif action == 2 and new_position < prev_position and prev_position > 0:  # Sell Long
+                btc_amount = prev_position - new_position
+                revenue = new_balance - prev_balance
+                fee = revenue * 0.0018
+                pnl = (current_price - prev_entry_price) * btc_amount - fee if prev_entry_price > 0 else 0
+                
+                trades.append({
+                    'step': step_count,
+                    'type': 'SELL_LONG',
+                    'price': current_price,
+                    'amount': btc_amount,
+                    'value': revenue,
+                    'fee': fee,
+                    'pnl': pnl
+                })
+                
+            elif action == 3 and new_position < prev_position:  # Sell Short
+                btc_amount = abs(new_position - prev_position)
+                short_value = new_balance - prev_balance
+                fee = short_value * 0.0018
+                
+                trades.append({
+                    'step': step_count,
+                    'type': 'SELL_SHORT',
+                    'price': current_price,
+                    'amount': btc_amount,
+                    'value': short_value,
+                    'fee': fee
+                })
+                
+            elif action == 4 and new_position > prev_position and prev_position < 0:  # Buy Short (cover)
+                btc_amount = new_position - prev_position
+                cost = prev_balance - new_balance
+                fee = cost * 0.0018
+                pnl = (prev_entry_price - current_price) * btc_amount - fee if prev_entry_price > 0 else 0
+                
+                trades.append({
+                    'step': step_count,
+                    'type': 'BUY_SHORT',
+                    'price': current_price,
+                    'amount': btc_amount,
+                    'value': cost,
+                    'fee': fee,
+                    'pnl': pnl
+                })
+            
+            # Also check for trailing stop-loss trades (handled by environment)
+            # These might close positions even if action was 0 (Hold)
+            if action == 0 and position_changed:
+                if prev_position > 0 and new_position == 0:  # Long closed
                     trades.append({
                         'step': step_count,
-                        'type': 'BUY_LONG',
+                        'type': 'TRAILING_STOP_LONG',
                         'price': current_price,
-                        'amount': btc_amount,
-                        'value': invest_amount,
-                        'fee': fee
+                        'amount': prev_position,
+                        'value': new_balance - prev_balance,
+                        'fee': (new_balance - prev_balance) * 0.0018,
+                        'pnl': (current_price - prev_entry_price) * prev_position - (new_balance - prev_balance) * 0.0018 if prev_entry_price > 0 else 0
                     })
-                    trade_executed = True
-
-        elif action == 2:  # Sell Long - закрыть часть длинной позиции
-            if position > 0:
-                sell_amount = min(position * 0.5, position)  # Sell max 50% position
-                if sell_amount * current_price > 10:  # Minimum trade value
-                    revenue = sell_amount * current_price
-                    fee = revenue * 0.0018
-                    revenue_after_fee = revenue - fee
-
-                    position -= sell_amount
-                    balance += revenue_after_fee
-                    total_fees += fee
-
-                    # Calculate P&L
-                    pnl = (current_price - entry_price) * sell_amount - fee
-
+                elif prev_position < 0 and new_position == 0:  # Short closed
                     trades.append({
                         'step': step_count,
-                        'type': 'SELL_LONG',
+                        'type': 'TRAILING_STOP_SHORT',
                         'price': current_price,
-                        'amount': sell_amount,
-                        'value': revenue_after_fee,
-                        'fee': fee,
-                        'pnl': pnl
+                        'amount': abs(prev_position),
+                        'value': prev_balance - new_balance,
+                        'fee': (prev_balance - new_balance) * 0.0018,
+                        'pnl': (prev_entry_price - current_price) * abs(prev_position) - (prev_balance - new_balance) * 0.0018 if prev_entry_price > 0 else 0
                     })
-                    trade_executed = True
 
-        elif action == 3:  # Sell Short - открыть короткую позицию
-            if balance > current_price * 1.002:  # Account for fee
-                short_value = min(balance * 0.1, balance)  # Max 10% of balance equivalent
-                if short_value > 10:  # Minimum trade
-                    fee = short_value * 0.0018
-                    short_after_fee = short_value - fee
-                    btc_amount = short_after_fee / current_price
-
-                    position -= btc_amount  # Negative position = short
-                    balance += short_value  # Receive money for shorting
-                    total_fees += fee
-                    entry_price = current_price
-
-                    trades.append({
-                        'step': step_count,
-                        'type': 'SELL_SHORT',
-                        'price': current_price,
-                        'amount': btc_amount,
-                        'value': short_value,
-                        'fee': fee
-                    })
-                    trade_executed = True
-
-        elif action == 4:  # Buy Short - закрыть короткую позицию
-            if position < 0:  # Have short position
-                cover_amount = min(abs(position) * 0.5, abs(position))  # Cover max 50% short
-                if cover_amount * current_price > 10:  # Minimum trade value
-                    cost = cover_amount * current_price
-                    fee = cost * 0.0018
-                    cost_with_fee = cost + fee
-
-                    position += cover_amount  # Reduce short position
-                    balance -= cost_with_fee  # Pay to cover short
-                    total_fees += fee
-
-                    # Calculate P&L for short position
-                    pnl = (entry_price - current_price) * cover_amount - fee
-
-                    trades.append({
-                        'step': step_count,
-                        'type': 'BUY_SHORT',
-                        'price': current_price,
-                        'amount': cover_amount,
-                        'value': cost_with_fee,
-                        'fee': fee,
-                        'pnl': pnl
-                    })
-                    trade_executed = True
-
-        # Record portfolio state
-        portfolio_value = balance + (position * current_price)
+        # Record portfolio state (use environment's state)
+        portfolio_value = env.balance + (env.position * current_price)
         portfolio_history.append({
             'step': step_count,
             'price': current_price,
-            'balance': balance,
-            'position': position,
+            'balance': env.balance,
+            'position': env.position,
             'portfolio_value': portfolio_value,
             'action': action
         })
 
-        # Progress logging
+        # Progress logging with action distribution
         if step_count % 1000 == 0:
             pnl = portfolio_value - initial_balance
-            print(f"Step {step_count:5d} | Portfolio: ${portfolio_value:10.2f} | P&L: ${pnl:8.2f} | Trades: {len(trades):3d}")
+            # Show both original model actions and actual executed actions
+            action_dist = f"H:{action_counts[0]} B:{action_counts[1]} S:{action_counts[2]} SS:{action_counts[3]} BS:{action_counts[4]}"
+            print(f"Step {step_count:5d} | Portfolio: ${portfolio_value:10.2f} | P&L: ${pnl:8.2f} | Trades: {len(trades):3d} | Model Actions: {action_dist}")
 
         state = next_state
 
@@ -325,9 +285,19 @@ def run_rl_paper_trading(model_path, data_path, initial_balance=10000):
     print(f"Buy Short Trades:    {len([t for t in trades if t['type'] == 'BUY_SHORT'])}")
     print(f"Stop-Loss Trades:    {len([t for t in trades if 'STOP-LOSS' in t.get('type', '')])}")
     print(f"Take-Profit Trades:  {len([t for t in trades if 'TAKE-PROFIT' in t.get('type', '')])}")
-    print(f"Total Fees:          ${total_fees:.2f}")
-    print(f"Final Position:      {position:.6f} BTC")
-    print(f"Final Balance:       ${balance:.2f}")
+    print(f"Total Fees:          ${env.total_fees:.2f}")
+    print(f"Final Position:      {env.position:.6f} BTC")
+    print(f"Final Balance:       ${env.balance:.2f}")
+    print(f"\nModel Action Distribution (original model choices):")
+    print(f"  Hold (0):          {action_counts[0]:,} ({action_counts[0]/step_count*100:.1f}%)")
+    print(f"  Buy Long (1):      {action_counts[1]:,} ({action_counts[1]/step_count*100:.1f}%)")
+    print(f"  Sell Long (2):     {action_counts[2]:,} ({action_counts[2]/step_count*100:.1f}%)")
+    print(f"  Sell Short (3):    {action_counts[3]:,} ({action_counts[3]/step_count*100:.1f}%)")
+    print(f"  Buy Short (4):     {action_counts[4]:,} ({action_counts[4]/step_count*100:.1f}%)")
+    if action_counts[2] > 0 and len([t for t in trades if t['type'] == 'SELL_SHORT']) > 0:
+        print(f"\n⚠️  Note: Model incorrectly chose 'Sell Long' (action 2) without position.")
+        print(f"   These were automatically converted to 'Sell Short' (action 3) to enable trading.")
+        print(f"   Recommendation: Retrain the model with proper action penalties.")
 
     # Plot results
     plt.figure(figsize=(15, 10))
@@ -431,7 +401,7 @@ def run_rl_paper_trading(model_path, data_path, initial_balance=10000):
             'sharpe_ratio': sharpe_ratio,
             'max_drawdown': max_drawdown,
             'total_trades': len(trades),
-            'total_fees': total_fees
+            'total_fees': env.total_fees
         },
         'trades': trades,
         'portfolio_history': portfolio_history
