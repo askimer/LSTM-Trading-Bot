@@ -516,9 +516,12 @@ class TradingEnvironment(gym.Env):
         if action == 4 and price_change_pct < 0:
             reward -= abs(price_change_pct) * 500   # Penalty for wrong short cover
 
-        # Penalty for holding too long without action (only if position exists)
-        if action == 0 and self.position != 0:  # Any position (long or short)
-            reward -= 0.01
+        # Penalty for holding too long without action
+        if action == 0:
+            if self.position != 0:  # Have position - small penalty
+                reward -= 0.005
+            else:  # No position - larger penalty to encourage action
+                reward -= 0.02
 
         # Large penalty for going negative
         if current_portfolio < self.initial_balance * 0.5:
