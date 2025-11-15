@@ -90,83 +90,49 @@ def run_rl_paper_trading(model_path, data_path, initial_balance=10000):
     while not done:
         step_count += 1
 
-        # Save previous state BEFORE executing action
-        prev_position = env.position
+        # Save state BEFORE action
         prev_balance = env.balance
-        prev_entry_price = env.entry_price
+        prev_position = env.position
 
         # Get action from RL model
         action, _ = model.predict(state, deterministic=True)
         action = int(action)  # Ensure action is integer
-        
-        # Actions: 0=Hold, 1=Buy Long, 2=Sell Long (close long), 3=Sell Short (open short), 4=Buy Short (close short)
-        # Action 2 (Sell Long) requires an existing long position
-        # Action 3 (Sell Short) is for selling without position (opening short)
-        # WORKAROUND: If model incorrectly chooses action 2 without position, convert to action 3
-        # This is a temporary fix for a poorly trained model - should retrain with proper penalties
-        
-        original_action = action
-        if action == 2 and env.position == 0:
-            # Model incorrectly chose "Sell Long" without position
-            # Convert to action 3 (Sell Short) which is correct for selling without position
-            action = 3
-            if step_count <= 10:
-                print(f"  ⚠️ Model error corrected: Action 2→3 (Sell Long→Sell Short) at step {step_count}")
-                print(f"     Note: Action 2 = close long position, Action 3 = open short position (sell without position)")
-        
-        # Also handle action 4 (Buy Short/cover) when no short position exists
-        if action == 4 and env.position >= 0:
-            # Model incorrectly chose "Buy Short" (cover) without short position
-            # Convert to action 0 (Hold) as there's nothing to cover
-            if step_count <= 10:
-                print(f"  ⚠️ Model error corrected: Action 4→0 (Buy Short→Hold) at step {step_count} (no short to cover)")
-            action = 0
-        
-        action_counts[original_action] += 1  # Track original action for statistics
-        
-        # Debug: Print state and action every 1000 steps
-        if step_count % 1000 == 0 and step_count <= 2000:
-            print(f"  Debug Step {step_count}: state[0:3]={state[0:3]}, position={env.position:.6f}, action={action}")
 
-        # Execute action in environment
+        # Track action distribution
+        action_counts[action] += 1
+
+        # Execute action in environment (environment handles all trading logic)
         next_state, reward, terminated, truncated, _ = env.step(action)
         done = terminated or truncated
 
         # Get current market data
         current_price = df.iloc[min(env.current_step, len(df)-1)].get('close', df.iloc[min(env.current_step, len(df)-1)].get('Close'))
 
-        # Get new state AFTER executing action
-        new_position = env.position
-        new_balance = env.balance
-        new_entry_price = env.entry_price
-        
-        # Detect if a trade occurred by checking position or balance changes
-        position_changed = abs(new_position - prev_position) > 1e-8
-        balance_changed = abs(new_balance - prev_balance) > 0.01
-        
-        # Track trades that occurred in the environment
-        if position_changed or balance_changed:
-            # Determine trade type based on action and position change
-            if action == 1 and new_position > prev_position:  # Buy Long
-                btc_amount = new_position - prev_position
-                invest_amount = prev_balance - new_balance
-                fee = abs(invest_amount) * 0.0018 if invest_amount > 0 else 0
-                
+        # Check if a trade occurred by comparing before/after states
+        balance_change = env.balance - prev_balance
+        position_change = env.position - prev_position
+
+        # Detect trades based on significant changes
+        if abs(balance_change) > 1 or abs(position_change) > 1e-6:
+            # Determine trade type
+            if position_change > 0 and balance_change < 0:  # Bought (long position increased, balance decreased)
+                btc_amount = position_change
+                invest_amount = abs(balance_change)
+                fee = invest_amount * 0.0018
                 trades.append({
                     'step': step_count,
                     'type': 'BUY_LONG',
                     'price': current_price,
                     'amount': btc_amount,
-                    'value': abs(invest_amount),
+                    'value': invest_amount,
                     'fee': fee
                 })
-                
-            elif action == 2 and new_position < prev_position and prev_position > 0:  # Sell Long
-                btc_amount = prev_position - new_position
-                revenue = new_balance - prev_balance
+
+            elif position_change < 0 and balance_change > 0 and prev_position > 0:  # Sold long (position decreased, balance increased)
+                btc_amount = abs(position_change)
+                revenue = balance_change
                 fee = revenue * 0.0018
-                pnl = (current_price - prev_entry_price) * btc_amount - fee if prev_entry_price > 0 else 0
-                
+                pnl = (current_price - (prev_balance / prev_position if prev_position != 0 else current_price)) * btc_amount - fee
                 trades.append({
                     'step': step_count,
                     'type': 'SELL_LONG',
@@ -176,12 +142,11 @@ def run_rl_paper_trading(model_path, data_path, initial_balance=10000):
                     'fee': fee,
                     'pnl': pnl
                 })
-                
-            elif action == 3 and new_position < prev_position:  # Sell Short
-                btc_amount = abs(new_position - prev_position)
-                short_value = new_balance - prev_balance
+
+            elif position_change < 0 and balance_change > 0 and prev_position >= 0:  # Sold short (opened short position)
+                btc_amount = abs(position_change)
+                short_value = balance_change
                 fee = short_value * 0.0018
-                
                 trades.append({
                     'step': step_count,
                     'type': 'SELL_SHORT',
@@ -190,13 +155,12 @@ def run_rl_paper_trading(model_path, data_path, initial_balance=10000):
                     'value': short_value,
                     'fee': fee
                 })
-                
-            elif action == 4 and new_position > prev_position and prev_position < 0:  # Buy Short (cover)
-                btc_amount = new_position - prev_position
-                cost = prev_balance - new_balance
+
+            elif position_change > 0 and balance_change < 0 and prev_position < 0:  # Covered short (closed short position)
+                btc_amount = position_change
+                cost = abs(balance_change)
                 fee = cost * 0.0018
-                pnl = (prev_entry_price - current_price) * btc_amount - fee if prev_entry_price > 0 else 0
-                
+                pnl = ((prev_balance / abs(prev_position) if prev_position != 0 else current_price) - current_price) * btc_amount - fee
                 trades.append({
                     'step': step_count,
                     'type': 'BUY_SHORT',
@@ -206,30 +170,6 @@ def run_rl_paper_trading(model_path, data_path, initial_balance=10000):
                     'fee': fee,
                     'pnl': pnl
                 })
-            
-            # Also check for trailing stop-loss trades (handled by environment)
-            # These might close positions even if action was 0 (Hold)
-            if action == 0 and position_changed:
-                if prev_position > 0 and new_position == 0:  # Long closed
-                    trades.append({
-                        'step': step_count,
-                        'type': 'TRAILING_STOP_LONG',
-                        'price': current_price,
-                        'amount': prev_position,
-                        'value': new_balance - prev_balance,
-                        'fee': (new_balance - prev_balance) * 0.0018,
-                        'pnl': (current_price - prev_entry_price) * prev_position - (new_balance - prev_balance) * 0.0018 if prev_entry_price > 0 else 0
-                    })
-                elif prev_position < 0 and new_position == 0:  # Short closed
-                    trades.append({
-                        'step': step_count,
-                        'type': 'TRAILING_STOP_SHORT',
-                        'price': current_price,
-                        'amount': abs(prev_position),
-                        'value': prev_balance - new_balance,
-                        'fee': (prev_balance - new_balance) * 0.0018,
-                        'pnl': (prev_entry_price - current_price) * abs(prev_position) - (prev_balance - new_balance) * 0.0018 if prev_entry_price > 0 else 0
-                    })
 
         # Record portfolio state (use environment's state)
         portfolio_value = env.balance + (env.position * current_price)
@@ -242,12 +182,11 @@ def run_rl_paper_trading(model_path, data_path, initial_balance=10000):
             'action': action
         })
 
-        # Progress logging with action distribution
+        # Progress logging
         if step_count % 1000 == 0:
             pnl = portfolio_value - initial_balance
-            # Show both original model actions and actual executed actions
             action_dist = f"H:{action_counts[0]} B:{action_counts[1]} S:{action_counts[2]} SS:{action_counts[3]} BS:{action_counts[4]}"
-            print(f"Step {step_count:5d} | Portfolio: ${portfolio_value:10.2f} | P&L: ${pnl:8.2f} | Trades: {len(trades):3d} | Model Actions: {action_dist}")
+            print(f"Step {step_count:5d} | Portfolio: ${portfolio_value:10.2f} | P&L: ${pnl:8.2f} | Trades: {len(trades):3d} | Actions: {action_dist}")
 
         state = next_state
 
