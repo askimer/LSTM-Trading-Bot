@@ -20,13 +20,17 @@ class TradingEnvironment(gym.Env):
     """
     Custom trading environment for RL agent
     """
-    def __init__(self, df, initial_balance=10000, transaction_fee=0.0018):
+    def __init__(self, df, initial_balance=10000, transaction_fee=0.0018, scaler_path='scaler_X.pkl'):
         super(TradingEnvironment, self).__init__()
 
         self.df = df.reset_index(drop=True)
         self.initial_balance = initial_balance
         self.transaction_fee = transaction_fee
         self.current_step = 0
+
+        # Load scaler for feature normalization
+        with open(scaler_path, 'rb') as f:
+            self.scaler = pickle.load(f)
 
         # Actions: 0=Hold, 1=Buy, 2=Sell
         self.action_space = spaces.Discrete(3)
@@ -62,19 +66,22 @@ class TradingEnvironment(gym.Env):
         position_norm = self.position / (self.balance * 0.1) if self.balance > 0 else 0
         price_norm = row['Close'] / 50000 - 1  # Normalize around typical BTC price
 
-        # Technical indicators
-        indicators = [
-            row.get('RSI_15', 50) / 100 - 0.5,
-            row.get('MACD_macd', 0) / 1000,
-            row.get('BB_15_upper', row['Close']) / row['Close'] - 1,
-            row.get('BB_15_lower', row['Close']) / row['Close'] - 1,
-            row.get('ATR_15', 100) / 1000,
-            row.get('OBV', 0) / 1e10,
-            row.get('AD', 0) / 1e10,
-            row.get('MFI_15', 50) / 100 - 0.5
+        # Technical indicators (raw values)
+        raw_indicators = [
+            row.get('RSI_15', 50),
+            row.get('MACD_macd', 0),
+            row.get('BB_15_upper', row['Close']),
+            row.get('BB_15_lower', row['Close']),
+            row.get('ATR_15', 100),
+            row.get('OBV', 0),
+            row.get('AD', 0),
+            row.get('MFI_15', 50)
         ]
 
-        state = np.array([balance_norm, position_norm, price_norm] + indicators, dtype=np.float32)
+        # Normalize indicators using the same scaler as LSTM
+        indicators_normalized = self.scaler.transform(np.array(raw_indicators).reshape(1, -1)).flatten()
+
+        state = np.array([balance_norm, position_norm, price_norm] + indicators_normalized.tolist(), dtype=np.float32)
         return state
 
     def step(self, action):
@@ -120,12 +127,30 @@ class TradingEnvironment(gym.Env):
                 # Small penalty for transaction
                 reward -= 0.01
 
-        # Calculate reward based on portfolio change
+        # Calculate reward based on portfolio change with volatility penalty
         current_portfolio = self.balance + self.position * current_price
         next_portfolio = self.balance + self.position * next_price
 
         portfolio_change = (next_portfolio - current_portfolio) / current_portfolio if current_portfolio > 0 else 0
-        reward += portfolio_change * 100  # Scale reward
+
+        # Volatility penalty (higher volatility = lower reward)
+        if len(self.portfolio_values) > 1:
+            recent_portfolios = self.portfolio_values[-10:] + [current_portfolio]
+            volatility = np.std(np.diff(recent_portfolios)) / np.mean(recent_portfolios) if np.mean(recent_portfolios) > 0 else 0
+            volatility_penalty = volatility * 10  # Scale penalty
+        else:
+            volatility_penalty = 0
+
+        reward += portfolio_change * 100 - volatility_penalty
+
+        # Exploration bonus for non-hold actions
+        if action != 0:
+            reward += 0.01  # Small bonus for taking action
+
+        # Slippage penalty (simulate slippage as 0.1% of trade value)
+        if action == 1 or action == 2:
+            slippage_penalty = abs(portfolio_change) * 0.001  # 0.1% slippage
+            reward -= slippage_penalty
 
         # Penalty for holding too long without action
         if action == 0 and self.position > 0:

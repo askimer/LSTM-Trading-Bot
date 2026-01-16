@@ -1,7 +1,7 @@
 import pandas as pd
 import os
 import ta
-import talib
+
 from enum import Enum
 
 def calculate_ema(data, window):
@@ -136,7 +136,8 @@ def calculate_HT_DCPERIOD(data, _):
 def calculate_BETA(data, window):
     high = data['High']
     low = data['Low']
-    return talib.BETA(high, low, timeperiod=window)
+    beta_indicator = ta.momentum.BetaIndicator(high, low, window=window)
+    return beta_indicator.beta()
 
 def calculate_VAR(data, window):
     close = data['Close']
@@ -239,7 +240,6 @@ i=0
 for chunk in pd.read_csv('./btc_usdt_data/full_btc_usdt_data_cleaned.csv', chunksize=chunk_size, dtype=dtypes, low_memory=False):
     processed_chunk, overlap = process_chunk(chunk, overlap, indicators, window_size)
 
-    processed_chunk = processed_chunk.rename(columns={'Close': 'close'})
     processed_chunk.to_csv(output_file, mode='a', header=not os.path.exists(output_file), index=False)
     i+=len(processed_chunk)
     print(f'Processed chunk, {i} rows saved to {output_file}')

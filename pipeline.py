@@ -57,6 +57,8 @@ def rename_data_folder():
 def create_tuning_data():
     """Create trading_alg_tuning_data by copying btc_usdt_training_data."""
     if os.path.exists('btc_usdt_training_data'):
+        if os.path.exists('trading_alg_tuning_data'):
+            shutil.rmtree('trading_alg_tuning_data')
         shutil.copytree('btc_usdt_training_data', 'trading_alg_tuning_data')
         print("Created trading_alg_tuning_data")
     else:
@@ -65,52 +67,35 @@ def create_tuning_data():
 def create_paper_trade_data():
     """Create paper_trade_data by copying btc_usdt_training_data."""
     if os.path.exists('btc_usdt_training_data'):
+        if os.path.exists('paper_trade_data'):
+            shutil.rmtree('paper_trade_data')
         shutil.copytree('btc_usdt_training_data', 'paper_trade_data')
         print("Created paper_trade_data")
     else:
         print("btc_usdt_training_data not found, cannot create paper trade data")
 
-def modify_train_lstm():
-    """Modify train_lstm.py to use correct data path."""
-    # Read the file
-    with open('train_lstm.py', 'r') as f:
+def set_config_paths():
+    """Set correct data paths in config.py"""
+    with open('config.py', 'r') as f:
         content = f.read()
 
-    # Replace the data loading line
-    old_line = "    df = pd.read_csv('btc_usdt_data/full_btc_usdt_data_feature_engineered.csv')"
-    new_line = "    df = pd.read_csv('./btc_usdt_training_data/full_btc_usdt_data_feature_engineered.csv')"
-    content = content.replace(old_line, new_line)
+    # Update paths
+    content = content.replace(
+        "TRAINING_DATA_PATH = './btc_usdt_training_data/full_btc_usdt_data_feature_engineered.csv'",
+        f"TRAINING_DATA_PATH = './btc_usdt_training_data/full_btc_usdt_data_feature_engineered.csv'"
+    )
+    content = content.replace(
+        "TUNING_DATA_PATH = './trading_alg_tuning_data/full_btc_usdt_data_feature_engineered.csv'",
+        f"TUNING_DATA_PATH = './trading_alg_tuning_data/full_btc_usdt_data_feature_engineered.csv'"
+    )
+    content = content.replace(
+        "PAPER_TRADE_DATA_PATH = './paper_trade_data/full_btc_usdt_data_feature_engineered.csv'",
+        f"PAPER_TRADE_DATA_PATH = './paper_trade_data/full_btc_usdt_data_feature_engineered.csv'"
+    )
 
-    # Write back
-    with open('train_lstm.py', 'w') as f:
+    with open('config.py', 'w') as f:
         f.write(content)
-    print("Modified train_lstm.py to use correct data path")
-
-def modify_strategy_tuning():
-    """Modify strategy_tuning.py to use correct data path."""
-    with open('strategy_tuning.py', 'r') as f:
-        content = f.read()
-
-    old_line = "df = pd.read_csv('./trading_alg_tuning_data/full_btc_usdt_data_feature_engineered.csv')"
-    new_line = "df = pd.read_csv('./trading_alg_tuning_data/full_btc_usdt_data_feature_engineered.csv')"
-    # Already correct, but ensure it exists
-    if old_line in content:
-        pass  # Already correct
-
-    print("strategy_tuning.py data path is correct")
-
-def modify_paper_trading():
-    """Modify paper_trading.py to use correct data path."""
-    with open('paper_trading.py', 'r') as f:
-        content = f.read()
-
-    old_line = "df = pd.read_csv('./paper_trade_data_heaven/full_btc_usdt_data_feature_engineered.csv')"
-    new_line = "df = pd.read_csv('./paper_trade_data/full_btc_usdt_data_feature_engineered.csv')"
-    content = content.replace(old_line, new_line)
-
-    with open('paper_trading.py', 'w') as f:
-        f.write(content)
-    print("Modified paper_trading.py to use correct data path")
+    print("Updated config.py with correct paths")
 
 def find_latest_model():
     """Find the latest model file (LSTM or RL)."""
@@ -126,11 +111,11 @@ def find_latest_model():
     # Check for LSTM models
     lstm_models = glob.glob('lstm_model_*.pt')
     if lstm_models:
-        # Sort by MSE (assuming filename format lstm_model_{mse}.pt)
-        lstm_models.sort(key=lambda x: int(x.split('_')[-1].split('.')[0]))
-        latest_model = lstm_models[-1]  # The one with highest MSE
-        print(f"Using LSTM model: {latest_model}")
-        return latest_model
+        # Sort by MSE ascending (lowest MSE is best)
+        lstm_models.sort(key=lambda x: float(x.split('_')[-1].split('.')[0]))
+        best_model = lstm_models[0]  # The one with lowest MSE
+        print(f"Using LSTM model: {best_model}")
+        return best_model
 
     print("No model files found!")
     sys.exit(1)
@@ -193,11 +178,7 @@ def main(start_from=1):
             create_tuning_data(),
             create_paper_trade_data()
         )),
-        3: ("Modify Scripts for Correct Paths", lambda: (
-            modify_train_lstm(),
-            modify_strategy_tuning(),
-            modify_paper_trading()
-        )),
+        3: ("Set Config Paths", lambda: set_config_paths()),
         4: ("Train Model", lambda: run_script('train_rl.py' if args.rl else 'train_lstm.py')),
         5: ("Tune Trading Strategy", lambda: (
             model_file := find_latest_model(),

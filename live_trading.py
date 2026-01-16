@@ -13,6 +13,7 @@ import numpy as np
 import torch
 import pickle
 import ccxt
+import ta
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -34,7 +35,7 @@ class LiveTradingBot:
     Live trading bot that uses trained LSTM model for virtual trading on BingX
     """
 
-    def __init__(self, model_path, scaler_path, symbol='BTC-USDT', test_mode=True):
+    def __init__(self, model_path, scaler_path='scaler_X.pkl', symbol='BTC-USDT', test_mode=True):
         """
         Initialize the trading bot
 
@@ -76,7 +77,8 @@ class LiveTradingBot:
             'sell_percentage': 0.314003,
             'buy_percentage': 0.671026,
             'window_size': 17,
-            'min_profit_threshold': 0.768993
+            'min_profit_threshold': 0.768993,
+            'stop_loss_percent': 0.02  # 2% stop loss
         }
 
         # Virtual portfolio
@@ -165,96 +167,42 @@ class LiveTradingBot:
             data = df.tail(50).copy()
 
             # Basic price data
-            close = data['close'].values
-            high = data['high'].values
-            low = data['low'].values
-            volume = data['volume'].values
+            close = data['close']
+            high = data['high']
+            low = data['low']
+            volume = data['volume']
 
-            # Calculate indicators (simplified versions)
+            # Calculate indicators using ta library
             indicators = {}
 
             # RSI
-            def calculate_rsi(prices, period=14):
-                deltas = np.diff(prices)
-                seed = deltas[:period+1]
-                up = seed[seed >= 0].sum()/period
-                down = -seed[seed < 0].sum()/period
-                rs = up/down
-                rsi = np.zeros_like(prices)
-                rsi[:period] = 100. - 100./(1.+rs)
+            rsi_indicator = ta.momentum.RSIIndicator(close, window=15)
+            indicators['RSI_15'] = rsi_indicator.rsi().iloc[-1]
 
-                for i in range(period, len(prices)):
-                    delta = deltas[i-1]
-                    if delta > 0:
-                        upval = delta
-                        downval = 0.
-                    else:
-                        upval = 0.
-                        downval = -delta
+            # ATR
+            atr_indicator = ta.volatility.AverageTrueRange(high, low, close, window=15)
+            indicators['ATR_15'] = atr_indicator.average_true_range().iloc[-1]
 
-                    up = (up*(period-1) + upval)/period
-                    down = (down*(period-1) + downval)/period
-
-                    rs = up/down
-                    rsi[i] = 100. - 100./(1.+rs)
-                return rsi
-
-            indicators['RSI_15'] = calculate_rsi(close)[-1]
-
-            # ATR (simplified)
-            tr = np.maximum(high - low,
-                          np.maximum(np.abs(high - np.roll(close, 1)),
-                                   np.abs(low - np.roll(close, 1))))
-            indicators['ATR_15'] = np.mean(tr[-15:])
-
-            # MACD (simplified)
-            ema12 = pd.Series(close).ewm(span=12).mean()
-            ema26 = pd.Series(close).ewm(span=26).mean()
-            indicators['MACD_macd'] = (ema12 - ema26).iloc[-1]
+            # MACD
+            macd_indicator = ta.trend.MACD(close, window_slow=26, window_fast=12, window_sign=9)
+            indicators['MACD_macd'] = macd_indicator.macd().iloc[-1]
 
             # Bollinger Bands
-            sma20 = pd.Series(close).rolling(20).mean()
-            std20 = pd.Series(close).rolling(20).std()
-            indicators['BB_15_upper'] = (sma20 + 2*std20).iloc[-1]
-            indicators['BB_15_lower'] = (sma20 - 2*std20).iloc[-1]
+            bb_indicator = ta.volatility.BollingerBands(close, window=15, window_dev=2)
+            indicators['BB_15_upper'] = bb_indicator.bollinger_hband().iloc[-1]
+            indicators['BB_15_lower'] = bb_indicator.bollinger_lband().iloc[-1]
 
             # OBV
-            obv = np.zeros(len(close))
-            obv[0] = volume[0]
-            for i in range(1, len(close)):
-                if close[i] > close[i-1]:
-                    obv[i] = obv[i-1] + volume[i]
-                elif close[i] < close[i-1]:
-                    obv[i] = obv[i-1] - volume[i]
-                else:
-                    obv[i] = obv[i-1]
-            indicators['OBV'] = obv[-1]
+            obv_indicator = ta.volume.OnBalanceVolumeIndicator(close, volume)
+            indicators['OBV'] = obv_indicator.on_balance_volume().iloc[-1]
 
-            # AD (Accumulation/Distribution)
-            ad = np.zeros(len(close))
-            for i in range(len(close)):
-                if high[i] != low[i]:
-                    ad[i] = ((close[i] - low[i]) - (high[i] - close[i])) / (high[i] - low[i]) * volume[i]
-                else:
-                    ad[i] = 0
-                if i > 0:
-                    ad[i] += ad[i-1]
-            indicators['AD'] = ad[-1]
+            # AD
+            ad_indicator = ta.volume.AccDistIndexIndicator(high, low, close, volume)
+            indicators['AD'] = ad_indicator.acc_dist_index().iloc[-1]
 
-            # MFI (Money Flow Index)
-            typical_price = (high + low + close) / 3
-            money_flow = typical_price * volume
-            positive_flow = np.where(typical_price > np.roll(typical_price, 1), money_flow, 0)
-            negative_flow = np.where(typical_price < np.roll(typical_price, 1), money_flow, 0)
-
-            positive_mf = np.sum(positive_flow[-14:])
-            negative_mf = np.sum(negative_flow[-14:])
-
-            if negative_mf != 0:
-                money_ratio = positive_mf / negative_mf
-                indicators['MFI_15'] = 100 - (100 / (1 + money_ratio))
-            else:
-                indicators['MFI_15'] = 100
+            # MFI
+            mfi_indicator = ta.volume.MFIIndicator(high, low, close, volume, window=15)
+            indicators['MFI_15'] = mfi_indicator.money_flow_index().iloc[-1]
 
             return indicators
 
@@ -307,8 +255,12 @@ class LiveTradingBot:
             # Calculate trend and confidence
             if past_predictions:
                 past_average = np.mean(past_predictions[-self.params['window_size']:])
-                trend_direction = 'up' if prediction > past_average else 'down'
-                confidence = (prediction - past_average) / past_average if past_average != 0 else 0
+                if past_average != 0:
+                    trend_direction = 'up' if prediction > past_average else 'down'
+                    confidence = (prediction - past_average) / past_average
+                else:
+                    trend_direction = 'hold'
+                    confidence = 0
             else:
                 trend_direction = 'hold'
                 confidence = 0
@@ -341,6 +293,37 @@ class LiveTradingBot:
         """Execute virtual trade (no real transactions)"""
         try:
             trade_executed = False
+
+            # Check stop-loss
+            if self.position > 0 and current_price <= self.entry_price * (1 - self.params['stop_loss_percent']):
+                # Sell all position due to stop-loss
+                sell_amount = self.position
+                revenue = sell_amount * current_price
+                fee = revenue * 0.00018
+                revenue_after_fee = revenue - fee
+
+                self.position -= sell_amount
+                self.balance += revenue_after_fee
+                self.total_fees += fee
+
+                pnl = (current_price - self.entry_price) * sell_amount - fee
+
+                trade = {
+                    'timestamp': datetime.now(),
+                    'type': 'STOP_LOSS_SELL',
+                    'price': current_price,
+                    'amount': sell_amount,
+                    'value': revenue_after_fee,
+                    'fee': fee,
+                    'pnl': pnl,
+                    'confidence': 0
+                }
+
+                self.trades.append(trade)
+                trade_executed = True
+
+                logger.info(f"STOP LOSS SELL: {sell_amount:.6f} BTC at ${current_price:.2f}, PnL: ${pnl:.2f}")
+                return trade_executed
 
             if signal['should_buy'] and self.balance > 10:  # Minimum balance check
                 # Calculate investment amount

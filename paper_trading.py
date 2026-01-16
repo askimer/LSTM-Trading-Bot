@@ -5,6 +5,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pickle
 import random
+from config import PAPER_TRADE_DATA_PATH
 
 class LSTMRegressor(nn.Module):
     def __init__(self, input_dim, hidden_dim, num_layers=1):
@@ -26,7 +27,7 @@ best_model = best_model.to(device)
 best_model.eval()
 
 # load completely new test data
-df = pd.read_csv('./paper_trade_data/full_btc_usdt_data_feature_engineered.csv')
+df = pd.read_csv(PAPER_TRADE_DATA_PATH)
 df = df.dropna()
 
 # remove constant columns
@@ -68,6 +69,7 @@ def calculate_max_drawdown(portfolio_values):
 def run_simulation(alpha_atr, alpha_rsi, base_sell_threshold, base_buy_threshold, sell_percentage, buy_percentage, window_size, min_profit_threshold):
     current_budget = initial_budget
     assets_held = 0
+    entry_price = 0
     past_predictions = []
     portfolio_values = []
 
@@ -89,11 +91,13 @@ def run_simulation(alpha_atr, alpha_rsi, base_sell_threshold, base_buy_threshold
 
         past_predictions.append(prediction)
         past_average = calculate_past_average(past_predictions, window=window_size)
-        
-        trend_direction = 'up' if prediction > past_average else 'down'
-        # positive -> probably going up
-        # negative -> probably going down
-        confidence = (prediction - past_average) / past_average
+
+        if past_average != 0:
+            trend_direction = 'up' if prediction > past_average else 'down'
+            confidence = (prediction - past_average) / past_average
+        else:
+            trend_direction = 'hold'
+            confidence = 0
 
         asset_price = y[i][0]
 
@@ -108,6 +112,7 @@ def run_simulation(alpha_atr, alpha_rsi, base_sell_threshold, base_buy_threshold
             assets_bought = (rounded_investment / asset_price)
             assets_held += round(assets_bought, 8)
             current_budget -= rounded_investment
+            entry_price = asset_price
         elif trend_direction == 'down' and confidence <= sell_threshold and assets_held > 0:
             assets_to_sell = assets_held * sell_percentage * abs(confidence)
             sale_revenue = round(assets_to_sell, 8) * asset_price
@@ -117,6 +122,14 @@ def run_simulation(alpha_atr, alpha_rsi, base_sell_threshold, base_buy_threshold
 
         final_asset_value = assets_held * asset_price
         current_portfolio_value = current_budget + final_asset_value
+
+        # Check stop-loss (2%)
+        if assets_held > 0 and asset_price <= entry_price * 0.98:
+            # Sell all due to stop-loss
+            sale_revenue = assets_held * asset_price
+            fee = sale_revenue * trading_fee_percentage
+            current_budget += sale_revenue - fee
+            assets_held = 0
 
         if i % 1000 == 0:
             print(f"atr_value: {atr_value}, rsi_value: {rsi_value}")
@@ -217,7 +230,6 @@ for i in range(X.shape[0]):
         final_asset_value = assets_held * asset_price
         current_portfolio_value = current_budget + final_asset_value
         portfolio_values.append(current_portfolio_value)
-        assets_held = assets_held
 
 portfolio_values = np.array(portfolio_values)
 returns = np.diff(portfolio_values) / portfolio_values[:-1]  # Calculate returns

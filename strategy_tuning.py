@@ -6,6 +6,7 @@ import numpy as np
 import pickle
 import random
 import time
+from config import TUNING_DATA_PATH
 
 class LSTMRegressor(nn.Module):
     def __init__(self, input_dim, hidden_dim, num_layers=1):
@@ -27,7 +28,7 @@ best_model = best_model.to(device)
 best_model.eval()
 
 # load completely new test data
-df = pd.read_csv('./trading_alg_tuning_data/full_btc_usdt_data_feature_engineered.csv')
+df = pd.read_csv(TUNING_DATA_PATH)
 df = df.dropna()
 
 # remove constant columns

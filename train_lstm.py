@@ -14,7 +14,7 @@ from skorch.callbacks import EarlyStopping, ProgressBar
 import matplotlib.pyplot as plt
 
 import pickle
-import resource
+from config import TRAINING_DATA_PATH
 
 # Define the LSTM model using PyTorch
 class LSTMRegressor(nn.Module):
@@ -37,26 +37,14 @@ early_stopping = EarlyStopping(
 )
 
 if __name__ == "__main__":
-    # Try to set memory limit to encourage swap usage (optional)
-    try:
-        current_limits = resource.getrlimit(resource.RLIMIT_AS)
-        print(f"Current memory limits: soft={current_limits[0] // (1024**3)}GB, hard={current_limits[1] // (1024**3)}GB")
-        # Only set if current soft limit is higher than 16GB
-        if current_limits[0] > 16 * 1024 * 1024 * 1024:
-            soft_limit = 12 * 1024 * 1024 * 1024  # 12GB in bytes
-            hard_limit = current_limits[1]  # Keep current hard limit
-            resource.setrlimit(resource.RLIMIT_AS, (soft_limit, hard_limit))
-            print(f"Memory limit set to {soft_limit // (1024**3)}GB soft (to encourage swap usage)")
-        else:
-            print("Memory limit not changed (already reasonable)")
-    except ValueError as e:
-        print(f"Could not set memory limit: {e}. System will manage memory automatically.")
+    # Memory limit setting is Unix-specific, skip on Windows
+    pass
 
     # Check if CUDA is available
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Training on device {device}.")
     print("Loading data...")
-    df = pd.read_csv('./btc_usdt_data/full_btc_usdt_data_feature_engineered.csv')
+    df = pd.read_csv(TRAINING_DATA_PATH)
     df = df.dropna()
 
     print("Removing constant columns...")
@@ -64,8 +52,8 @@ if __name__ == "__main__":
     non_constant_columns = std_dev[std_dev != 0].index.tolist()
     df = df[non_constant_columns]
 
-    X = df.drop('close', axis=1).values
-    y = df['close'].values.reshape(-1, 1)
+    X = df.drop('Close', axis=1).values
+    y = df['Close'].values.reshape(-1, 1)
 
     print("Scaling data...")
     scaler_X = StandardScaler()
