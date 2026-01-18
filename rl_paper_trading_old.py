@@ -15,8 +15,8 @@ import pickle
 import time
 from datetime import datetime
 
-# Import the unified TradingEnvironment
-from trading_environment import TradingEnvironment
+# Import the latest TradingEnvironment from train_rl.py
+from train_rl import TradingEnvironment
 
 def calculate_sharpe_ratio(returns, risk_free_rate=0.000006811):
     """Calculate Sharpe ratio"""
@@ -92,7 +92,7 @@ def run_rl_paper_trading(model_path, data_path, initial_balance=10000, n_episode
             print(f"Episode {episode + 1}: data slice {start_idx}-{start_idx + eval_data_size}")
 
             # Initialize environment with same parameters as training
-            env = TradingEnvironment(eval_df, initial_balance=initial_balance, transaction_fee=0.0005)
+            env = TradingEnvironment(eval_df, initial_balance=initial_balance, transaction_fee=0.0018)
 
             # Run single episode
             result = _run_single_episode(env, model, initial_balance, eval_df, episode_number=episode+1, verbose=False)
@@ -149,35 +149,11 @@ def run_rl_paper_trading(model_path, data_path, initial_balance=10000, n_episode
         # Original full data simulation
         print("Initializing trading environment...")
         # Ensure same parameters as in train_rl.py
-        env = TradingEnvironment(df, initial_balance=initial_balance, transaction_fee=0.0005)
+        env = TradingEnvironment(df, initial_balance=initial_balance, transaction_fee=0.0018)
 
         # Run full data simulation
         results = _run_single_episode(env, model, initial_balance, df, episode_number=1, verbose=True)
         return results
-
-def _correct_action(action, env_position, env):
-    """
-    Correct action based on current position to prevent invalid trades
-    """
-    original_action = action
-    
-    # If trying to sell long but no long position, hold instead
-    if action == 2 and env_position <= 0:
-        return 0  # Hold
-    
-    # If trying to cover short but no short position, hold instead
-    if action == 4 and env_position >= 0:
-        return 0  # Hold
-    
-    # If trying to buy long when already have a large position, hold
-    if action == 1 and env_position > 0.01:  # Arbitrary limit
-        return 0  # Hold
-    
-    # If trying to sell short when already have a large short position, hold
-    if action == 3 and env_position < -0.01:  # Arbitrary limit
-        return 0  # Hold
-    
-    return action
 
 def _run_single_episode(env, model, initial_balance, df, episode_number=1, verbose=True):
     """Run a single episode"""
@@ -185,66 +161,52 @@ def _run_single_episode(env, model, initial_balance, df, episode_number=1, verbo
     trades = []
     portfolio_history = []
 
+    # use environment's state instead of separate variables
+    # This ensures synchronization with the environment
+
     state, _ = env.reset()
     done = False
     step_count = 0
     action_counts = {0: 0, 1: 0, 2: 0, 3: 0, 4: 0}  # Track action distribution
-    
-    # Track consecutive same actions to detect churning
-    consecutive_actions = []
-    max_consecutive_same = 0
 
     while not done and step_count < len(df) - 1:  # Safety limit
         step_count += 1
 
-        # Get current price
+        # Save previous state BEFORE executing action
+        prev_position = env.position
+        prev_balance = env.balance
+        prev_entry_price = env.entry_price
+
+        # Get current price BEFORE action processing (needed for portfolio check)
         current_price = df.iloc[min(env.current_step, len(df)-1)].get('close', df.iloc[min(env.current_step, len(df)-1)].get('Close'))
 
         # Get action from RL model
         action, _ = model.predict(state, deterministic=True)
         action = int(action)  # Ensure action is integer
-        
-        # Validate action is within bounds
-        if action < 0 or action >= env.action_space.n:
-            if verbose and step_count <= 10:
-                print(f"  ⚠️ Invalid action {action}, using Hold (0)")
-            action = 0  # Default to Hold if action is invalid
 
-        # Apply intelligent action correction
-        corrected_action = _correct_action(action, env.position, env)
-        if corrected_action != action and verbose and step_count <= 20:
-            print(f"  🛡️ Action corrected: {action} → {corrected_action} (position: {env.position:.6f})")
-        action = corrected_action
+        # Apply workarounds for poorly trained model
+        original_action = action
+        if action == 2 and env.position == 0:
+            action = 3
+            if step_count <= 10 and verbose:
+                print(f"  ⚠️ Model error corrected: Action 2→3 (Sell Long→Sell Short) at step {step_count}")
 
-        # Log consecutive actions to detect churning
-        if consecutive_actions and consecutive_actions[-1] == action:
-            consecutive_count = 1
-            for i in range(len(consecutive_actions) - 2, -1, -1):
-                if consecutive_actions[i] == action:
-                    consecutive_count += 1
-                else:
-                    break
-            if consecutive_count > max_consecutive_same:
-                max_consecutive_same = consecutive_count
-        consecutive_actions.append(action)
+        if action == 4 and env.position >= 0:
+            current_portfolio = env.balance + env.margin_locked + env.position * current_price
+            if current_portfolio >= env.initial_balance * 0.5:
+                action = 1
+                if step_count <= 10 and verbose:
+                    print(f"  ⚠️ Model error corrected: Action 4→1 (Buy Short→Buy Long) at step {step_count}")
+            else:
+                action = 0
+                if step_count <= 10 and verbose:
+                    print(f"  ⚠️ Model error corrected: Action 4→0 (Buy Short→Hold) at step {step_count}")
 
-        action_counts[action] += 1
+        action_counts[original_action] += 1
 
-        # Enhanced debugging for first few steps
+        # Debug first few steps
         if step_count <= 10 and verbose:
-            position_type = "NONE"
-            if env.position > 0:
-                position_type = "LONG"
-            elif env.position < 0:
-                position_type = "SHORT"
-            
-            print(f"  Step {step_count}:")
-            print(f"    State[0:3]: [{state[0]:.4f}, {state[1]:.4f}, {state[2]:.4f}]")
-            print(f"    Position: {env.position:.6f} ({position_type})")
-            print(f"    Balance: ${env.balance:.2f}")
-            print(f"    Price: ${current_price:.2f}")
-            print(f"    Action: {action}")
-            print(f"    Portfolio: ${env.balance + env.margin_locked + env.position * current_price - abs(env.position) * current_price * 0.0018:.2f}")
+            print(f"  Debug Step {step_count}: state[0:3]={state[0:3]}, position={env.position:.6f}, action={action}, balance=${env.balance:.2f}")
 
         # Execute action in environment
         next_state, reward, terminated, truncated, _ = env.step(action)
@@ -255,7 +217,7 @@ def _run_single_episode(env, model, initial_balance, df, episode_number=1, verbo
 
         # Record portfolio state
         current_price = df.iloc[min(env.current_step, len(df)-1)].get('close', df.iloc[min(env.current_step, len(df)-1)].get('Close'))
-        portfolio_value = env.balance + env.margin_locked + env.position * current_price - abs(env.position) * current_price * 0.0018
+        portfolio_value = env.balance + env.margin_locked + env.position * current_price
         portfolio_history.append({
             'step': step_count,
             'price': current_price,
@@ -268,13 +230,11 @@ def _run_single_episode(env, model, initial_balance, df, episode_number=1, verbo
         # Progress logging for single episodes
         if verbose and step_count % 1000 == 0:
             pnl = portfolio_value - initial_balance
-            pct_change = (pnl / initial_balance) * 100
-            print(f"  Step {step_count}: Portfolio=${portfolio_value:.2f} (PnL: {pct_change:+.2f}%)")
+            print("6d")
 
-        # Early stop for very long losing episodes - more reasonable threshold
-        if portfolio_value < initial_balance * 0.85 and step_count > 100:  # 15% loss threshold like training
-            if verbose:
-                print(f"Early stop: Portfolio < 85% initial balance at step {step_count}")
+        # Early stop for very long losing episodes
+        if portfolio_value < initial_balance * 0.1 and step_count > 1000:
+            print(f"Early stop: Portfolio < 10% initial balance")
             break
 
     # Calculate episode metrics
@@ -288,20 +248,13 @@ def _run_single_episode(env, model, initial_balance, df, episode_number=1, verbo
         returns = np.diff(portfolio_values) / portfolio_values[:-1]
         excess_returns = returns - 0.000006811  # Daily risk-free rate approximation
         sharpe_ratio = excess_returns.mean() / excess_returns.std() if excess_returns.std() > 0 else 0
-        max_drawdown = calculate_max_drawdown(portfolio_values)
+        max_drawdown = (np.minimum.accumulate(portfolio_values) - portfolio_values).min() / np.maximum.accumulate(portfolio_values).max()
     else:
         sharpe_ratio = 0
         max_drawdown = 0
 
     # Print episode summary
-    print(f"\n📊 Episode {episode_number} Summary:")
-    print(f"  Steps: {step_count}")
-    print(f"  Return: {total_return:.2f}%")
-    print(f"  Sharpe Ratio: {sharpe_ratio:.4f}")
-    print(f"  Max Drawdown: {max_drawdown*100:.2f}%")
-    print(f"  Final Portfolio: ${final_portfolio:.2f}")
-    print(f"  Action Distribution: {action_counts}")
-    print(f"  Max Consecutive Same Actions: {max_consecutive_same}")
+    print(f"Return: {total_return:.2f}% | Sharpe: {sharpe_ratio:.4f} | Max DD: {max_drawdown*100:.2f}%")
 
     results = {
         'initial_balance': initial_balance,
@@ -312,8 +265,7 @@ def _run_single_episode(env, model, initial_balance, df, episode_number=1, verbo
         'max_drawdown': max_drawdown,
         'steps': step_count,
         'action_counts': action_counts,
-        'portfolio_history': portfolio_history,
-        'max_consecutive_same': max_consecutive_same
+        'portfolio_history': portfolio_history
     }
 
     return results

@@ -10,12 +10,16 @@ import logging
 from datetime import datetime, timedelta
 import pandas as pd
 import numpy as np
+import torch
 import ccxt
 import ta
 from dotenv import load_dotenv
 from stable_baselines3 import PPO
 import gymnasium as gym
 from gymnasium import spaces
+
+# Import the unified trading environment
+from trading_environment import TradingEnvironment
 
 # Load environment variables
 load_dotenv()
@@ -31,149 +35,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-class TradingEnvironment(gym.Env):
-    """
-    Trading environment for RL agent (same as in train_rl.py)
-    """
-    def __init__(self, df, initial_balance=10000, transaction_fee=0.0018):
-        super(TradingEnvironment, self).__init__()
-
-        self.df = df.reset_index(drop=True)
-        self.initial_balance = initial_balance
-        self.transaction_fee = transaction_fee
-        self.current_step = 0
-
-        # Calculate dynamic price normalization based on data
-        price_col = 'close' if 'close' in df.columns else 'Close'
-        self.price_mean = df[price_col].mean()
-        self.price_std = df[price_col].std()
-
-        # Actions: 0=Hold, 1=Buy Long, 2=Sell Long, 3=Sell Short, 4=Buy Short
-        self.action_space = spaces.Discrete(5)
-
-        # State: [balance_norm, position_norm, price_norm, indicators...]
-        n_indicators = 7
-        self.observation_space = spaces.Box(
-            low=-np.inf, high=np.inf,
-            shape=(3 + n_indicators,), dtype=np.float32
-        )
-
-        self.reset()
-
-    def reset(self, seed=None, options=None):
-        self.current_step = 0
-        self.balance = self.initial_balance
-        self.position = 0
-        self.total_fees = 0
-        self.portfolio_values = [self.initial_balance]
-
-        return self._get_state(), {}
-
-    def _get_state(self):
-        """Get current state observation"""
-        if self.current_step >= len(self.df):
-            return np.zeros(self.observation_space.shape)
-
-        row = self.df.iloc[self.current_step]
-
-        # Normalize values
-        balance_norm = self.balance / self.initial_balance - 1
-        position_norm = self.position / (self.balance * 0.1) if self.balance > 0 else 0
-        current_price = row.get('close', row.get('Close', self.price_mean))
-        price_norm = (current_price - self.price_mean) / self.price_std
-
-        # Technical indicators
-        indicators = [
-            row.get('RSI_15', 50) / 100 - 0.5,
-            (row.get('BB_15_upper', current_price) / current_price - 1) if current_price > 0 else 0,
-            (row.get('BB_15_lower', current_price) / current_price - 1) if current_price > 0 else 0,
-            row.get('ATR_15', 100) / 1000,
-            row.get('OBV', 0) / 1e10,
-            row.get('AD', 0) / 1e10,
-            row.get('MFI_15', 50) / 100 - 0.5
-        ]
-
-        state = np.array([balance_norm, position_norm, price_norm] + indicators, dtype=np.float32)
-        return state
-
-    def step(self, action):
-        """Execute one step in environment"""
-        if self.current_step >= len(self.df) - 1:
-            terminated = True
-            truncated = False
-            reward = 0
-            return self._get_state(), reward, terminated, truncated, {}
-
-        current_price = self.df.iloc[self.current_step].get('close', self.df.iloc[self.current_step].get('Close'))
-        next_price = self.df.iloc[self.current_step + 1].get('close', self.df.iloc[self.current_step + 1].get('Close'))
-
-        reward = 0
-        terminated = False
-        truncated = False
-
-        # Execute action
-        if action == 1:  # Buy
-            if self.balance > current_price * (1 + self.transaction_fee):
-                invest_amount = min(self.balance * 0.1, self.balance - 100)
-                fee = invest_amount * self.transaction_fee
-                coins_bought = (invest_amount - fee) / current_price
-
-                self.position += coins_bought
-                self.balance -= invest_amount
-                self.total_fees += fee
-                reward -= 0.01
-
-        elif action == 2:  # Sell
-            if self.position > 0:
-                sell_amount = self.position * 0.5
-                revenue = sell_amount * current_price
-                fee = revenue * self.transaction_fee
-
-                self.position -= sell_amount
-                self.balance += revenue - fee
-                self.total_fees += fee
-                reward -= 0.01
-
-        # Calculate reward
-        current_portfolio = self.balance + self.position * current_price
-        next_portfolio = self.balance + self.position * next_price
-        portfolio_change = (next_portfolio - current_portfolio) / current_portfolio if current_portfolio > 0 else 0
-
-        if len(self.portfolio_values) >= 10:
-            recent_portfolio_values = self.portfolio_values[-10:]
-            returns = np.diff(recent_portfolio_values) / recent_portfolio_values[:-1]
-            volatility = np.std(returns) if len(returns) > 0 else 0
-            risk_penalty = volatility * 50
-        else:
-            risk_penalty = 0
-
-        reward += (portfolio_change * 10000) - risk_penalty
-
-        # Additional reward components
-        price_change_pct = (next_price - current_price) / current_price if current_price > 0 else 0
-
-        if action == 1 and price_change_pct > 0:
-            reward += abs(price_change_pct) * 1000
-        if action == 1 and price_change_pct < 0:
-            reward -= abs(price_change_pct) * 500
-        if action == 2 and price_change_pct < 0:
-            reward += abs(price_change_pct) * 1000
-        if action == 2 and price_change_pct > 0:
-            reward -= abs(price_change_pct) * 500
-
-        if action == 0 and self.position > 0:
-            reward -= 0.01
-
-        if current_portfolio < self.initial_balance * 0.5:
-            reward -= 10
-
-        self.portfolio_values.append(current_portfolio)
-        self.current_step += 1
-
-        if self.current_step >= len(self.df) - 1:
-            terminated = True
-
-        return self._get_state(), reward, terminated, truncated, {}
+# The TradingEnvironment class has been moved to trading_environment.py
+# This file now imports it from the unified module
 
 class RLLiveTradingBot:
     """
@@ -225,6 +88,13 @@ class RLLiveTradingBot:
         self.position = 0  # BTC position (positive = long, negative = short)
         self.entry_price = 0
         self.total_fees = 0
+        self.cumulative_pnl = 0.0  # Track cumulative P&L between trades
+
+        # Separate tracking for long and short positions
+        self.long_position = 0  # Positive BTC amount for long positions
+        self.short_position = 0  # Positive BTC amount for short positions
+        self.long_entry_price = 0
+        self.short_entry_price = 0
 
         # Trailing stop-loss and take-profit tracking
         self.trailing_stop_loss = 0
@@ -246,9 +116,20 @@ class RLLiveTradingBot:
         # Market data buffer (need enough data for indicators)
         self.market_data_buffer = []
 
+        # Trading rate limiting (increased for real market conditions)
+        self.last_trade_time = 0
+        self.min_trade_interval = 300  # Minimum 5 minutes between trades for real market
+
         logger.info(f"Initialized RL Live Trading Bot for {symbol}")
         logger.info(f"Test mode: {test_mode}")
         logger.info(f"Initial balance: {self.initial_balance} USDT")
+
+    def calculate_fee(self, amount, fee_rate=0.0005):
+        """Расчет комиссий для фьючерсов BingX (тейкер: 0.05%, мейкер: 0.02%)"""
+        # Для бессрочных фьючерсов: 0.02% (мейкер) / 0.05% (тейкер)
+        # Для стандартных фьючерсов: 0.045% (фиксированная, списывается при закрытии)
+        # По умолчанию используем ставку тейкера (0.05%), так как бот использует рыночные ордера
+        return amount * fee_rate
 
     def get_market_data(self):
         """Get current market data from BingX using CCXT"""
@@ -283,8 +164,35 @@ class RLLiveTradingBot:
 
             return df
 
+        except ccxt.AuthenticationError as e:
+            logger.error(f"Authentication error accessing exchange: {e}")
+            return None
+        except ccxt.ExchangeError as e:
+            logger.error(f"Exchange error: {e}")
+            return None
+        except ccxt.NetworkError as e:
+            logger.error(f"Network error connecting to exchange: {e}")
+            # Implement retry logic
+            time.sleep(5)  # Wait before retry
+            try:
+                klines = self.exchange.fetch_ohlcv(symbol_ccxt, timeframe='1m', limit=350)
+                # Process data similarly
+                df = pd.DataFrame(klines, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+                df['close_time'] = df['timestamp'] + pd.Timedelta(minutes=1)
+                df['quote_volume'] = df['volume'] * df['close']
+                df['trades'] = 0
+                df['taker_buy_volume'] = df['volume'] * 0.5
+                df['taker_buy_quote_volume'] = df['taker_buy_volume'] * df['close']
+                df['ignore'] = 0
+                numeric_cols = ['open', 'high', 'low', 'close', 'volume', 'quote_volume', 'taker_buy_volume', 'taker_buy_quote_volume']
+                df[numeric_cols] = df[numeric_cols].astype(float)
+                return df
+            except Exception as retry_e:
+                logger.error(f"Retry failed: {retry_e}")
+                return None
         except Exception as e:
-            logger.error(f"Error getting market data: {e}")
+            logger.error(f"Unexpected error getting market data: {e}")
             return None
 
     def calculate_indicators(self, df):
@@ -453,7 +361,8 @@ class RLLiveTradingBot:
         try:
             # Normalize values (same as in TradingEnvironment)
             balance_norm = self.balance / self.initial_balance - 1
-            position_norm = self.position / (self.balance * 0.1) if self.balance > 0 else 0
+            # Fix position normalization for short positions
+            position_norm = self.position / (abs(self.balance) * 0.1) if self.balance != 0 else 0
 
             # Use historical price data for normalization if available
             if self.price_history:
@@ -484,22 +393,44 @@ class RLLiveTradingBot:
             return np.zeros(10, dtype=np.float32)  # Fallback state
 
     def execute_virtual_trade(self, action, current_price):
-        """Execute virtual trade (no real transactions) - updated for short positions"""
+        """Execute virtual trade with separate long/short position tracking"""
         try:
+            # Check trading rate limit
+            current_time = time.time()
+            if current_time - self.last_trade_time < self.min_trade_interval:
+                logger.debug(f"Trade rate limited. Last trade: {current_time - self.last_trade_time:.1f}s ago, min interval: {self.min_trade_interval}s")
+                return False
+
             trade_executed = False
 
             if action == 1:  # Buy Long - открыть/добавить длинную позицию
-                if self.balance > current_price * 1.002:  # Account for fee
-                    invest_amount = min(self.balance * 0.1, self.balance * 0.5)  # Max 10% or 50% of balance
-                    if invest_amount > 10:  # Minimum trade
-                        fee = invest_amount * 0.0018
-                        invest_after_fee = invest_amount - fee
-                        btc_amount = invest_after_fee / current_price
+                # Limit position size to 50% of initial balance
+                max_position_value = self.initial_balance * 0.5
+                current_position_value = self.long_position * current_price
+                available_for_long = max_position_value - current_position_value
 
-                        self.position += btc_amount
+                invest_amount = min(self.balance * 0.2, available_for_long)  # 20% от баланса
+                if invest_amount > 10:  # Minimum trade
+                    fee = self.calculate_fee(invest_amount)
+                    if self.balance >= invest_amount:  # Check sufficient funds
+                        btc_amount = (invest_amount - fee) / current_price
+
+                        # Update long position with correct average price calculation
+                        old_position_value = self.long_entry_price * self.long_position
+                        new_position_value = current_price * btc_amount
+                        total_value = old_position_value + new_position_value
+                        self.long_position += btc_amount
+                        self.long_entry_price = total_value / self.long_position if self.long_position > 0 else current_price
+
+                        # Update overall position
+                        self.position = self.long_position - self.short_position
                         self.balance -= invest_amount
-                        self.entry_price = current_price
                         self.total_fees += fee
+
+                        # Reset trailing parameters for long position
+                        self.highest_price_since_entry = current_price
+                        self.trailing_stop_loss = current_price * (1 - self.trailing_stop_distance)
+                        self.trailing_take_profit = current_price * (1 + self.take_profit_pct)
 
                         trade = {
                             'timestamp': datetime.now(),
@@ -509,27 +440,43 @@ class RLLiveTradingBot:
                             'value': invest_amount,
                             'fee': fee,
                             'balance_after': self.balance,
-                            'position_after': self.position
+                            'position_after': self.position,
+                            'long_position': self.long_position,
+                            'short_position': self.short_position
                         }
 
                         self.trades.append(trade)
                         trade_executed = True
 
-                        logger.info(f"VIRTUAL BUY LONG: {btc_amount:.6f} BTC at ${current_price:.2f}")
+                        logger.info(f"VIRTUAL BUY LONG: {btc_amount:.6f} BTC at ${current_price:.2f}, Long Position: {self.long_position:.6f}, Long avg price: ${self.long_entry_price:.2f}")
+                        self.last_trade_time = current_time
 
             elif action == 2:  # Sell Long - закрыть часть длинной позиции
-                if self.position > 0:
-                    sell_amount = min(self.position * 0.5, self.position)  # Sell max 50% position
+                if self.long_position > 0:
+                    sell_amount = min(self.long_position * 0.5, self.long_position)  # Sell max 50% of long position
                     if sell_amount * current_price > 10:  # Minimum trade value
                         revenue = sell_amount * current_price
-                        fee = revenue * 0.0018
+                        fee = self.calculate_fee(revenue)
                         revenue_after_fee = revenue - fee
 
-                        pnl = (current_price - self.entry_price) * sell_amount - fee
+                        pnl = (current_price - self.long_entry_price) * sell_amount - fee
 
-                        self.position -= sell_amount
+                        # Update long position
+                        self.long_position -= sell_amount
+
+                        # Update overall position
+                        self.position = self.long_position - self.short_position
                         self.balance += revenue_after_fee
                         self.total_fees += fee
+
+                        # Update cumulative P&L
+                        self.cumulative_pnl += pnl
+
+                        # Reset trailing parameters if position closed
+                        if self.long_position == 0:
+                            self.highest_price_since_entry = 0
+                            self.trailing_stop_loss = 0
+                            self.trailing_take_profit = 0
 
                         trade = {
                             'timestamp': datetime.now(),
@@ -539,27 +486,44 @@ class RLLiveTradingBot:
                             'value': revenue_after_fee,
                             'fee': fee,
                             'pnl': pnl,
+                            'cumulative_pnl': self.cumulative_pnl,
                             'balance_after': self.balance,
-                            'position_after': self.position
+                            'position_after': self.position,
+                            'long_position': self.long_position,
+                            'short_position': self.short_position
                         }
 
                         self.trades.append(trade)
                         trade_executed = True
 
-                        logger.info(f"VIRTUAL SELL LONG: {sell_amount:.6f} BTC at ${current_price:.2f}, PnL: ${pnl:.2f}")
+                        logger.info(f"VIRTUAL SELL LONG: {sell_amount:.6f} BTC at ${current_price:.2f}, Trade PnL: ${pnl:.2f}, Cumulative P&L: ${self.cumulative_pnl:.2f}")
+                        self.last_trade_time = current_time
 
             elif action == 3:  # Sell Short - открыть короткую позицию
-                if self.balance > current_price * 1.002:  # Account for fee
-                    short_value = min(self.balance * 0.1, self.balance)  # Max 10% of balance equivalent
-                    if short_value > 10:  # Minimum trade
-                        fee = short_value * 0.0018
-                        short_after_fee = short_value - fee
-                        btc_amount = short_after_fee / current_price
+                # Check if we can afford to open short
+                short_value = min(self.balance * 0.1, self.balance)  # Max 10% of balance equivalent
+                if short_value > 10:  # Minimum trade
+                    fee = self.calculate_fee(short_value)
+                    # Just check if we can afford the fee (more realistic margin check)
+                    if self.balance >= fee:  # Can afford transaction fee
+                        btc_amount = (short_value - fee) / current_price
 
-                        self.position -= btc_amount  # Negative position = short
+                        # Update short position with correct average price calculation
+                        old_position_value = self.short_entry_price * self.short_position
+                        new_position_value = current_price * btc_amount
+                        total_value = old_position_value + new_position_value
+                        self.short_position += btc_amount
+                        self.short_entry_price = total_value / self.short_position if self.short_position > 0 else current_price
+
+                        # Update overall position
+                        self.position = self.long_position - self.short_position
                         self.balance += short_value  # Receive money for shorting
-                        self.entry_price = current_price
                         self.total_fees += fee
+
+                        # Reset trailing parameters for short position
+                        self.lowest_price_since_entry = current_price
+                        self.trailing_stop_loss = current_price * (1 + self.trailing_stop_distance)
+                        self.trailing_take_profit = current_price * (1 - self.take_profit_pct)
 
                         trade = {
                             'timestamp': datetime.now(),
@@ -569,44 +533,70 @@ class RLLiveTradingBot:
                             'value': short_value,
                             'fee': fee,
                             'balance_after': self.balance,
-                            'position_after': self.position
+                            'position_after': self.position,
+                            'long_position': self.long_position,
+                            'short_position': self.short_position
                         }
 
                         self.trades.append(trade)
                         trade_executed = True
 
-                        logger.info(f"VIRTUAL SELL SHORT: {btc_amount:.6f} BTC at ${current_price:.2f}")
+                        logger.info(f"VIRTUAL SELL SHORT: {btc_amount:.6f} BTC at ${current_price:.2f}, Short Position: {self.short_position:.6f}")
+                        self.last_trade_time = current_time
 
             elif action == 4:  # Buy Short - закрыть короткую позицию
-                if self.position < 0:  # Have short position
-                    cover_amount = min(abs(self.position) * 0.5, abs(self.position))  # Cover max 50% short
+                if self.short_position > 0:  # Have short position
+                    cover_amount = min(self.short_position * 0.5, self.short_position)  # Cover max 50% short
                     if cover_amount * current_price > 10:  # Minimum trade value
                         cost = cover_amount * current_price
-                        fee = cost * 0.0018
+                        fee = self.calculate_fee(cost)
                         cost_with_fee = cost + fee
 
-                        pnl = (self.entry_price - current_price) * cover_amount - fee  # Profit from short
+                        if self.balance >= cost_with_fee:  # Check sufficient funds to cover
+                            # ПРАВИЛЬНЫЙ РАСЧЕТ P&L ДЛЯ ШОРТА
+                            entry_price = self.short_entry_price if self.short_entry_price > 0 else current_price
+                            pnl = (entry_price - current_price) * cover_amount - fee
 
-                        self.position += cover_amount  # Reduce short position
-                        self.balance -= cost_with_fee  # Pay to cover short
-                        self.total_fees += fee
+                            # Update short position
+                            self.short_position -= cover_amount
 
-                        trade = {
-                            'timestamp': datetime.now(),
-                            'type': 'BUY_SHORT',
-                            'price': current_price,
-                            'amount': cover_amount,
-                            'value': cost_with_fee,
-                            'fee': fee,
-                            'pnl': pnl,
-                            'balance_after': self.balance,
-                            'position_after': self.position
-                        }
+                            # Update overall position
+                            self.position = self.long_position - self.short_position
+                            self.balance -= cost_with_fee  # Pay to cover short
+                            self.total_fees += fee
 
-                        self.trades.append(trade)
-                        trade_executed = True
+                            # Update cumulative P&L
+                            self.cumulative_pnl += pnl
 
-                        logger.info(f"VIRTUAL BUY SHORT: {cover_amount:.6f} BTC at ${current_price:.2f}, PnL: ${pnl:.2f}")
+                            # Reset trailing parameters if position closed
+                            if self.short_position == 0:
+                                self.lowest_price_since_entry = float('inf')
+                                self.trailing_stop_loss = 0
+                                self.trailing_take_profit = 0
+
+                            trade = {
+                                'timestamp': datetime.now(),
+                                'type': 'BUY_SHORT',
+                                'price': current_price,
+                                'amount': cover_amount,
+                                'value': cost_with_fee,
+                                'fee': fee,
+                                'pnl': pnl,
+                                'cumulative_pnl': self.cumulative_pnl,
+                                'balance_after': self.balance,
+                                'position_after': self.position,
+                                'long_position': self.long_position,
+                                'short_position': self.short_position
+                            }
+
+                            self.trades.append(trade)
+                            trade_executed = True
+
+                            logger.info(f"VIRTUAL BUY SHORT: {cover_amount:.6f} BTC at ${current_price:.2f}, Trade PnL: ${pnl:.2f}, Cumulative P&L: ${self.cumulative_pnl:.2f}")
+                            self.last_trade_time = current_time
+                        else:
+                            logger.warning("Insufficient funds to cover short position")
+                            return False
 
             return trade_executed
 
@@ -614,9 +604,233 @@ class RLLiveTradingBot:
             logger.error(f"Error executing virtual trade: {e}")
             return False
 
-    def run_live_session(self, duration_minutes=60):
-        """Run live trading session for specified duration"""
+    def run_live_session_websocket(self, duration_minutes=60):
+        """Run live trading session with WebSocket real-time price updates"""
+        logger.info(f"🚀 Starting RL Live Trading Session (WebSocket) for {duration_minutes} minutes")
+        print("=" * 70)
+        print("🌐 WebSocket Real-Time Trading Mode")
+        print("⚡ Rapid price change detection enabled")
+        print(f"Duration: {duration_minutes} minutes")
+        print(f"Symbol: {self.symbol}")
+        print(f"Test Mode: {self.test_mode}")
+        print(f"Initial Balance: ${self.initial_balance:.2f}")
+        print("=" * 70)
+
+        start_time = datetime.now()
+        end_time = start_time + timedelta(minutes=duration_minutes)
+
+        # WebSocket price monitoring
+        import websocket
+        import json
+        import threading
+
+        last_price = None
+        price_change_threshold = 0.001  # 0.1% price change threshold for decision
+        last_decision_time = time.time() - 60  # Allow immediate first decision
+        min_decision_interval = 5  # Minimum 5 seconds between decisions
+
+        def on_message(ws, message):
+            nonlocal last_price, last_decision_time
+
+            try:
+                data = json.loads(message)
+
+                # Check if this is a trade event (Binance format)
+                if 'e' in data and data['e'] == 'trade' and 'p' in data:
+                    current_price = float(data['p'])
+                # Alternative format with data array
+                elif 'data' in data and isinstance(data['data'], list) and len(data['data']) > 0 and 'price' in data['data'][0]:
+                    current_price = float(data['data'][0]['price'])
+                else:
+                    return  # Skip non-trade messages
+
+                # Log current price occasionally (every 10 seconds)
+                current_time = time.time()
+                if not hasattr(on_message, 'last_price_log') or current_time - on_message.last_price_log > 10:
+                    logger.info(f"💰 Current BTC price: ${current_price:.2f}")
+                    on_message.last_price_log = current_time
+
+                # Initialize last_price on first message
+                if last_price is None:
+                    last_price = current_price
+                    self.price_history.append(current_price)
+                    logger.info(f"WebSocket connected. Initial price: ${current_price:.2f}")
+                    return
+
+                # Calculate price change
+                price_change_pct = abs(current_price - last_price) / last_price
+
+                # Add to price history
+                self.price_history.append(current_price)
+
+                # Decision trigger conditions
+                time_since_last_decision = time.time() - last_decision_time
+                significant_price_change = price_change_pct >= price_change_threshold
+                minimum_time_passed = time_since_last_decision >= min_decision_interval
+
+                if significant_price_change and minimum_time_passed:
+                    # Price changed significantly - make trading decision
+                    logger.info(f"⚡ Significant price change detected: {last_price:.2f} → {current_price:.2f} ({price_change_pct*100:.2f}%)")
+
+                    # Process trading decision on significant price change
+                    self.process_trading_decision(current_price)
+
+                    last_decision_time = time.time()
+
+                last_price = current_price
+
+            except Exception as e:
+                logger.error(f"WebSocket message error: {e}")
+
+        def on_error(ws, error):
+            logger.error(f"WebSocket error: {error}")
+
+        def on_close(ws, close_status_code, close_msg):
+            logger.info("WebSocket connection closed")
+
+        def on_open(ws):
+            # Subscribe to BTC/USDT trades stream (Binance format)
+            subscribe_message = {
+                "method": "SUBSCRIBE",
+                "params": [
+                    f"{self.symbol.lower()}@trade"  # Real-time trade stream
+                ],
+                "id": 1
+            }
+            ws.send(json.dumps(subscribe_message))
+            logger.info("Subscribed to real-time trade stream")
+
+        # Initialize market data buffer
+        print("Loading initial market data...")
+        for attempt in range(5):
+            df = self.get_market_data()
+            if df is not None and len(df) >= 300:
+                self.market_data_buffer = df
+                last_price = df['close'].iloc[-1]
+                print(f"✅ Initial data loaded with {len(df)} candles")
+                break
+            else:
+                print(f"Attempt {attempt + 1}: Insufficient market data, retrying...")
+                time.sleep(5)
+
+        if len(self.market_data_buffer) < 300:
+            logger.error("Failed to initialize market data buffer")
+            return
+
+        # Try Binance WebSocket first (public endpoint)
+        try:
+            import urllib.request
+            urllib.request.urlopen('https://api.binance.com', timeout=5)
+            use_binance = True
+        except:
+            use_binance = False
+
+        if use_binance:
+            # WebSocket URL for Binance (more reliable)
+            ws_url = "wss://stream.binance.com:9443/ws/btcusdt@trade"
+            logger.info("Using Binance WebSocket (fallback)")
+        else:
+            # WebSocket URL for BingX
+            ws_url = "wss://ws.biex.com/ws"  # BingX official WebSocket endpoint
+
+        # Start WebSocket connection
+        ws = websocket.WebSocketApp(ws_url,
+                                  on_message=on_message,
+                                  on_error=on_error,
+                                  on_close=on_close,
+                                  on_open=on_open)
+
+        # Create and start WebSocket thread
+        ws_thread = threading.Thread(target=ws.run_forever)
+        ws_thread.daemon = True
+        ws_thread.start()
+
+        try:
+            while datetime.now() < end_time:
+                time.sleep(1)  # Keep main thread alive
+
+                # Progress logging every minute
+                elapsed_minutes = (datetime.now() - start_time).total_seconds() / 60
+                if elapsed_minutes % 1 < 0.1 and int(elapsed_minutes) > 0 and int(elapsed_minutes) != getattr(on_message, 'last_progress_min', 0):
+                    on_message.last_progress_min = int(elapsed_minutes)
+                    portfolio_value = self.balance + (self.position * (last_price or self.initial_balance))
+                    pnl = portfolio_value - self.initial_balance
+                    logger.info(f"Session Progress: {elapsed_minutes:.0f}min | Portfolio: ${portfolio_value:.2f} | P&L: ${pnl:.2f} | Trades: {len(self.trades)}")
+
+            ws.close()
+            logger.info("RL Live trading session completed (WebSocket)")
+            self.generate_report()
+
+        except KeyboardInterrupt:
+            ws.close()
+            logger.info("Session interrupted by user")
+            self.generate_report()
+
+    def process_trading_decision(self, current_price):
+        """Process trading decision when significant price change detected"""
+        try:
+            # Update market data buffer with latest price
+            new_candle = {
+                'timestamp': pd.Timestamp.now(),
+                'open': current_price,
+                'high': current_price,
+                'low': current_price,
+                'close': current_price,
+                'volume': 1000.0  # Dummy volume for indicators
+            }
+
+            self.market_data_buffer = pd.concat([
+                self.market_data_buffer,
+                pd.DataFrame([new_candle])
+            ]).tail(350)
+
+            # Calculate indicators with updated data
+            indicators = self.calculate_indicators(self.market_data_buffer)
+            if indicators is None:
+                return
+
+            # Create RL state
+            state = self.get_rl_state(indicators, current_price)
+
+            # Get action from RL model
+            action, _ = self.model.predict(state, deterministic=True)
+            if isinstance(action, (np.ndarray, torch.Tensor)):
+                action = int(action.item())
+
+            # Get action probabilities and log them
+            state_tensor = torch.tensor(state.reshape(1, -1), dtype=torch.float32)
+            dist = self.model.policy.get_distribution(state_tensor)
+            action_probs = dist.distribution.probs[0].detach().numpy()
+            logger.info(f"Action weights: Hold={action_probs[0]:.4f}, Buy_Long={action_probs[1]:.4f}, Sell_Long={action_probs[2]:.4f}, Sell_Short={action_probs[3]:.4f}, Buy_Short={action_probs[4]:.4f}")
+
+            # Log decision
+            action_names = {0: 'HOLD', 1: 'BUY_LONG', 2: 'SELL_LONG', 3: 'SELL_SHORT', 4: 'BUY_SHORT'}
+            logger.info(f"⚡ DECISION: Current price ${current_price:.2f}, Action: {action_names.get(action, f'UNKNOWN({action})')}")
+
+            # Execute virtual trade
+            trade_executed = self.execute_virtual_trade(action, current_price)
+
+            # Record portfolio state
+            portfolio_value = self.balance + (self.position * current_price)
+            self.portfolio_history.append({
+                'timestamp': datetime.now(),
+                'price': current_price,
+                'balance': self.balance,
+                'position': self.position,
+                'portfolio_value': portfolio_value,
+                'action': action,
+                'indicators': indicators
+            })
+
+            self.indicators_history.append(indicators)
+
+        except Exception as e:
+            logger.error(f"Error in trading decision: {e}")
+
+    def run_live_session(self, duration_minutes=60, check_interval_seconds=10):
+        """Run live trading session for specified duration with faster price checking"""
         logger.info(f"🚀 Starting RL Live Trading Session for {duration_minutes} minutes")
+        logger.info(f"⚡ Price check interval: {check_interval_seconds} seconds")
         print("=" * 70)
         print(f"Duration: {duration_minutes} minutes")
         print(f"Symbol: {self.symbol}")
@@ -666,8 +880,8 @@ class RLLiveTradingBot:
                     time.sleep(60)
                     continue
 
-                # Update trailing levels if we have a position
-                if self.position > 0:
+                # Update trailing levels for long positions
+                if self.long_position > 0:
                     # Update highest price since entry
                     if current_price > self.highest_price_since_entry:
                         self.highest_price_since_entry = current_price
@@ -677,59 +891,151 @@ class RLLiveTradingBot:
 
                         # Update trailing take-profit (10% above entry, but trails with price)
                         self.trailing_take_profit = max(self.trailing_take_profit,
-                                                      self.entry_price * (1 + self.take_profit_pct),
+                                                      self.long_entry_price * (1 + self.take_profit_pct),
                                                       self.highest_price_since_entry * 0.95)  # At least 5% profit
+
+                # Update trailing levels for short positions
+                if self.short_position > 0:
+                    # Update lowest price since entry (good for shorts - price going down)
+                    if current_price < self.lowest_price_since_entry:
+                        self.lowest_price_since_entry = current_price
+
+                        # Update trailing stop-loss (should be ABOVE current price for shorts - protect against price increases)
+                        self.trailing_stop_loss = self.lowest_price_since_entry * (1 + self.trailing_stop_distance)
+
+                        # Update trailing take-profit (should be BELOW entry price for shorts - profit from price decreases)
+                        self.trailing_take_profit = min(self.trailing_take_profit,
+                                                      self.short_entry_price * (1 - self.take_profit_pct),
+                                                      self.lowest_price_since_entry * 0.95)  # Protection from too aggressive take-profit
 
                 # Check for stop-loss or take-profit triggers
                 stop_loss_triggered = False
                 take_profit_triggered = False
+                position_type = None
 
-                if self.position > 0:
-                    # Check stop-loss
+                if self.long_position > 0:
+                    # Check stop-loss for long position
                     if current_price <= self.trailing_stop_loss:
                         stop_loss_triggered = True
-                        logger.info(f"🛑 STOP-LOSS triggered at ${current_price:.2f} (trailing: ${self.trailing_stop_loss:.2f})")
+                        position_type = "LONG"
+                        logger.info(f"🛑 LONG STOP-LOSS triggered at ${current_price:.2f} (trailing: ${self.trailing_stop_loss:.2f})")
 
-                    # Check take-profit
+                    # Check take-profit for long position
                     elif current_price >= self.trailing_take_profit:
                         take_profit_triggered = True
-                        logger.info(f"💰 TAKE-PROFIT triggered at ${current_price:.2f} (trailing: ${self.trailing_take_profit:.2f})")
+                        position_type = "LONG"
+                        logger.info(f"💰 LONG TAKE-PROFIT triggered at ${current_price:.2f} (trailing: ${self.trailing_take_profit:.2f})")
 
-                # Force sell if stop-loss or take-profit triggered
+                elif self.short_position > 0:
+                    # Check stop-loss for short position (price went up too much)
+                    if current_price >= self.trailing_stop_loss:
+                        stop_loss_triggered = True
+                        position_type = "SHORT"
+                        logger.info(f"🛑 SHORT STOP-LOSS triggered at ${current_price:.2f} (trailing: ${self.trailing_stop_loss:.2f})")
+
+                    # Check take-profit for short position (price went down enough)
+                    elif current_price <= self.trailing_take_profit:
+                        take_profit_triggered = True
+                        position_type = "SHORT"
+                        logger.info(f"💰 SHORT TAKE-PROFIT triggered at ${current_price:.2f} (trailing: ${self.trailing_take_profit:.2f})")
+
+                # Force close position if stop-loss or take-profit triggered
                 if stop_loss_triggered or take_profit_triggered:
-                    if self.position > 0:
-                        revenue = self.position * current_price
-                        fee = revenue * 0.0018
+                    if position_type == "LONG" and self.long_position > 0:
+                        revenue = self.long_position * current_price
+                        fee = self.calculate_fee(revenue)
                         revenue_after_fee = revenue - fee
 
-                        pnl = (current_price - self.entry_price) * self.position - fee
+                        pnl = (current_price - self.long_entry_price) * self.long_position - fee
 
                         self.balance += revenue_after_fee
                         self.total_fees += fee
+                        self.cumulative_pnl += pnl
 
                         trigger_type = "STOP-LOSS" if stop_loss_triggered else "TAKE-PROFIT"
 
                         trade = {
                             'timestamp': datetime.now(),
-                            'type': f'FORCE_SELL_{trigger_type}',
+                            'type': f'FORCE_SELL_LONG_{trigger_type}',
                             'price': current_price,
-                            'amount': self.position,
+                            'amount': self.long_position,
                             'value': revenue_after_fee,
                             'fee': fee,
                             'pnl': pnl,
+                            'cumulative_pnl': self.cumulative_pnl,
                             'trigger_price': self.trailing_stop_loss if stop_loss_triggered else self.trailing_take_profit,
                             'balance_after': self.balance,
-                            'position_after': 0
+                            'position_after': self.long_position - self.short_position,
+                            'long_position': 0,
+                            'short_position': self.short_position
                         }
 
                         self.trades.append(trade)
 
-                        self.position = 0
-                        self.entry_price = 0
+                        # Reset long position
+                        self.long_position = 0
+                        self.long_entry_price = 0
+                        self.highest_price_since_entry = 0
                         self.trailing_stop_loss = 0
                         self.trailing_take_profit = 0
-                        self.highest_price_since_entry = 0
+
+                        # Update overall position
+                        self.position = self.long_position - self.short_position
+
+                        trade_executed = True
+                        continue  # Skip normal RL action this step
+
+                    elif position_type == "SHORT" and self.short_position > 0:
+                        # For short positions, we need to BUY back the BTC we shorted
+                        cost_to_cover = self.short_position * current_price  # Cost to buy back BTC
+                        fee = self.calculate_fee(cost_to_cover)
+                        total_cost = cost_to_cover + fee
+
+                        # Profit from short: (entry_price - exit_price) * amount - fee
+                        pnl = (self.short_entry_price - current_price) * self.short_position - fee
+
+                        # Handle potential deficit (if price went up too much)
+                        if self.balance >= total_cost:
+                            self.balance -= total_cost
+                        else:
+                            # Short position default - price went against us too much
+                            deficit = total_cost - self.balance
+                            self.balance = 0  # Balance cannot be negative
+                            self.cumulative_pnl -= deficit  # Additional loss from deficit
+                            logger.error(f"🚨 SHORT POSITION DEFAULT! Deficit: ${deficit:.2f}")
+
+                        self.total_fees += fee
+                        self.cumulative_pnl += pnl
+
+                        trigger_type = "STOP-LOSS" if stop_loss_triggered else "TAKE-PROFIT"
+
+                        trade = {
+                            'timestamp': datetime.now(),
+                            'type': f'FORCE_BUY_SHORT_{trigger_type}',
+                            'price': current_price,
+                            'amount': self.short_position,
+                            'value': total_cost,
+                            'fee': fee,
+                            'pnl': pnl,
+                            'cumulative_pnl': self.cumulative_pnl,
+                            'trigger_price': self.trailing_stop_loss if stop_loss_triggered else self.trailing_take_profit,
+                            'balance_after': self.balance,
+                            'position_after': self.long_position - self.short_position,
+                            'long_position': self.long_position,
+                            'short_position': 0
+                        }
+
+                        self.trades.append(trade)
+
+                        # Reset short position
+                        self.short_position = 0
+                        self.short_entry_price = 0
                         self.lowest_price_since_entry = float('inf')
+                        self.trailing_stop_loss = 0
+                        self.trailing_take_profit = 0
+
+                        # Update overall position
+                        self.position = self.long_position - self.short_position
 
                         trade_executed = True
                         continue  # Skip normal RL action this step
@@ -739,6 +1045,21 @@ class RLLiveTradingBot:
 
                 # Get action from RL model
                 action, _ = self.model.predict(state, deterministic=True)
+
+                # Ensure action is a scalar int
+                if isinstance(action, (np.ndarray, torch.Tensor)):
+                    action = int(action.item())
+
+                # Get action probabilities and log them
+                state_tensor = torch.tensor(state.reshape(1, -1), dtype=torch.float32)
+                dist = self.model.policy.get_distribution(state_tensor)
+                action_probs = dist.distribution.probs[0].detach().numpy()
+                logger.info(f"Action weights: Hold={action_probs[0]:.4f}, Buy_Long={action_probs[1]:.4f}, Sell_Long={action_probs[2]:.4f}, Sell_Short={action_probs[3]:.4f}, Buy_Short={action_probs[4]:.4f}")
+
+                # Determine action name for logging
+                action_names = {0: 'HOLD', 1: 'BUY_LONG', 2: 'SELL_LONG', 3: 'SELL_SHORT', 4: 'BUY_SHORT'}
+                logger.info(f"Current price: ${current_price:.2f}")
+                logger.info(f"Chosen action: {action_names.get(action, f'UNKNOWN({action})')}")
 
                 # Execute virtual trade
                 trade_executed = self.execute_virtual_trade(action, current_price)
@@ -758,14 +1079,14 @@ class RLLiveTradingBot:
                 self.price_history.append(current_price)
                 self.indicators_history.append(indicators)
 
-                # Progress logging every 5 minutes
+                # Progress logging every minute (more frequent)
                 elapsed_minutes = (time.time() - session_start) / 60
-                if elapsed_minutes % 5 < 1:  # Log roughly every 5 minutes
-                    pnl = portfolio_value - self.initial_balance
-                    logger.info(f"Session Progress: {elapsed_minutes:.1f}min | Portfolio: ${portfolio_value:.2f} | P&L: ${pnl:.2f} | Trades: {len(self.trades)}")
+                if elapsed_minutes % 1 < 0.1:  # Log roughly every minute
+                    pnl_pct = (self.cumulative_pnl / self.initial_balance) * 100
+                    logger.info(f"Session Progress: {elapsed_minutes:.1f}min | Portfolio: ${portfolio_value:.2f} | Balance: ${self.balance:.2f} | Long: {self.long_position:+.6f} BTC | Short: {self.short_position:+.6f} BTC | Net: {self.position:+.6f} BTC | Cumulative P&L: ${self.cumulative_pnl:+.2f} ({pnl_pct:+.2f}%) | Trades: {len(self.trades)}")
 
-                # Wait before next iteration (1 minute)
-                time.sleep(60)
+                # Wait before next iteration (configurable interval)
+                time.sleep(check_interval_seconds)
 
             except Exception as e:
                 logger.error(f"Error in live session: {e}")
@@ -832,8 +1153,15 @@ Trading Activity:
 - Buy Trades: {len([t for t in self.trades if t['type'] == 'BUY'])}
 - Sell Trades: {len([t for t in self.trades if t['type'] == 'SELL'])}
 
+Profit Analysis:
+- Long Positions P&L: ${sum(t.get('pnl', 0) for t in self.trades if 'SELL_LONG' in t.get('type', '')):.2f}
+- Short Positions P&L: ${sum(t.get('pnl', 0) for t in self.trades if 'BUY_SHORT' in t.get('type', '')):.2f}
+- Forced Closures P&L: ${sum(t.get('pnl', 0) for t in self.trades if 'FORCE' in t.get('type', '')):.2f}
+
 Final Position:
-- BTC Held: {self.position:.6f}
+- Long BTC: {self.long_position:.6f}
+- Short BTC: {self.short_position:.6f}
+- Net BTC: {self.position:.6f}
 - USDT Balance: ${self.balance:.2f}
 """
 
@@ -881,6 +1209,8 @@ def main():
                        help="Initial virtual balance")
     parser.add_argument("--real-trades", action="store_true",
                        help="⚠️  WARNING: This would enable REAL trades (currently not implemented)")
+    parser.add_argument("--websocket", action="store_true",
+                       help="Enable WebSocket real-time trading mode (default: 1-minute intervals)")
 
     args = parser.parse_args()
 
@@ -900,7 +1230,11 @@ def main():
             initial_balance=args.balance
         )
 
-        bot.run_live_session(duration_minutes=args.duration)
+        # Choose trading method based on arguments
+        if args.websocket:
+            bot.run_live_session_websocket(duration_minutes=args.duration)
+        else:
+            bot.run_live_session(duration_minutes=args.duration)
 
     except Exception as e:
         logger.error(f"Error running RL live trading: {e}")

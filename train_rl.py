@@ -10,25 +10,85 @@ import pandas as pd
 from gymnasium import spaces
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv
-from stable_baselines3.common.callbacks import BaseCallback, EvalCallback
+from stable_baselines3.common.callbacks import BaseCallback, EvalCallback, CheckpointCallback
 from stable_baselines3.common.monitor import Monitor
+from stable_baselines3.common.vec_env import SubprocVecEnv
+from stable_baselines3.common.utils import get_linear_fn
 import pickle
 import torch
 import matplotlib.pyplot as plt
 from sklearn.preprocessing import StandardScaler
 import time
+import os
+import random
+
+# Import the unified trading environment
+from trading_environment import TradingEnvironment
+
+# Set seeds for reproducibility
+def set_seeds(seed=42):
+    """Set random seeds for reproducible results"""
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    random.seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+# Call set_seeds at the beginning of the module
+set_seeds()
+
+class EvaluationLoggerCallback(EvalCallback):
+    """Simplified EvalCallback that safely logs results to file"""
+
+    def __init__(self, log_file="rl_evaluation_log.txt", *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.log_file = log_file
+        # Simple header initialization (only if file doesn't exist)
+        import os
+        if not os.path.exists(self.log_file):
+            with open(self.log_file, 'w') as f:
+                f.write("Timestep,Mean Reward,Mean Episode Length,Balance,Portfolio Value,PnL,PnL %\n")
+
+    def _on_step(self):
+        """Simplified logging - only log reward without complex portfolio tracking"""
+        result = super()._on_step()
+
+        if (self.eval_freq > 0 and
+            self.n_calls % self.eval_freq == 0 and
+            hasattr(self, 'last_mean_reward') and
+            self.last_mean_reward is not None):
+
+            current_timestep = self.num_timesteps
+            mean_reward = self.last_mean_reward
+
+            try:
+                with open(self.log_file, 'a') as f:
+                    # Log only basics: timestep, reward, and placeholders for portfolio data
+                    f.write(f"{current_timestep},{mean_reward:.2f},0.00,0.00,0.00,0.00,0.00\n")
+            except Exception as e:
+                print(f"Warning: Could not write to evaluation log: {e}")
+
+        return result
+
+
 
 class RLTrainingProgressCallback(BaseCallback):
     """Custom callback to show detailed RL training progress"""
 
     def __init__(self, total_timesteps, eval_freq=10000, verbose=1):
-        super().__init__(verbose)
+        # Don't pass verbose to super() to avoid logger property issues
+        super().__init__()
         self.total_timesteps = total_timesteps
         self.eval_freq = eval_freq
         self.start_time = None
         self.last_eval_time = None
         self.episode_rewards = []
         self.episode_lengths = []
+        self.verbose = verbose
 
     def _on_training_start(self):
         """Called at the beginning of training"""
@@ -64,15 +124,32 @@ class RLTrainingProgressCallback(BaseCallback):
             filled_length = int(bar_length * progress)
             bar = "█" * filled_length + "░" * (bar_length - filled_length)
 
-            print(f"📈 Timestep {current_timestep:6,}/{self.total_timesteps:6,} | [{bar}] {progress*100:5.1f}% | TPS: {timesteps_per_sec:6.0f} | ETA: {eta_str}")
+            # Get additional metrics if available
+            info_str = ""
+            if hasattr(self.model, 'logger') and self.model.logger.name_to_value:
+                try:
+                    # Try to get some useful metrics
+                    loss_info = []
+                    if 'train/loss' in self.model.logger.name_to_value:
+                        loss_info.append(f"Loss: {self.model.logger.name_to_value['train/loss']:.4f}")
+                    if 'train/value_loss' in self.model.logger.name_to_value:
+                        loss_info.append(f"V-Loss: {self.model.logger.name_to_value['train/value_loss']:.4f}")
+                    if 'train/policy_gradient_loss' in self.model.logger.name_to_value:
+                        loss_info.append(f"PG-Loss: {self.model.logger.name_to_value['train/policy_gradient_loss']:.4f}")
+                    if loss_info:
+                        info_str = " | " + " | ".join(loss_info)
+                except:
+                    pass
+
+            print(f"📈 Timestep {current_timestep:6,}/{self.total_timesteps:6,} | [{bar}] {progress*100:5.1f}% | TPS: {timesteps_per_sec:6.0f} | ETA: {eta_str}{info_str}", end='\r', flush=True)
 
         # Show evaluation results
         if self.eval_freq > 0 and current_timestep % self.eval_freq == 0 and current_timestep > 0:
             if hasattr(self, 'last_mean_reward'):
                 eval_elapsed = time.time() - (self.last_eval_time or self.start_time)
                 print(f"🎯 Evaluation at {current_timestep:,} timesteps:")
-                print(f"   Mean Reward: {self.last_mean_reward:.2f}")
-                print(f"   Mean Episode Length: {self.last_mean_length:.1f}")
+                if hasattr(self, 'last_mean_reward') and self.last_mean_reward is not None:
+                    print(f"   Mean Reward: {self.last_mean_reward:.2f}")
                 print(f"   Evaluation Time: {eval_elapsed:.1f}s")
                 print()
 
@@ -88,468 +165,67 @@ class RLTrainingProgressCallback(BaseCallback):
         print(f"Average timesteps/second: {self.total_timesteps/total_time:.1f}")
         print()
 
-class TradingEnvironment(gym.Env):
+# The TradingEnvironment class has been moved to trading_environment.py
+# This file now imports it from the unified module
+
+def make_env(df, rank):
+    """Create environment with error handling for parallel processing"""
+    def _init():
+        try:
+            env = TradingEnvironment(df)
+            env = Monitor(env, f"./rl_logs/monitor_{rank}")
+            return env
+        except Exception as e:
+            print(f"Error creating environment {rank}: {e}")
+            raise
+    return _init
+
+def preprocess_data(df):
+    """Улучшенная предобработка данных"""
+    print(f"Preprocessing data: {len(df)} initial rows")
+
+    # Удаление дубликатов
+    initial_rows = len(df)
+    df = df.drop_duplicates(subset=['timestamp'] if 'timestamp' in df.columns else ['Open time'] if 'Open time' in df.columns else None)
+    if len(df) < initial_rows:
+        print(f"Removed {initial_rows - len(df)} duplicate rows")
+
+    # Обработка экстремальных значений
+    numeric_columns = df.select_dtypes(include=[np.number]).columns
+    outliers_removed = 0
+    for col in numeric_columns:
+        if col not in ['timestamp', 'Open time', 'timestamp_close'] and not col.startswith('ignore'):
+            # Удаление значений вне 3 сигм
+            mean = df[col].mean()
+            std = df[col].std()
+            if std > 0:  # Avoid division by zero
+                before_count = len(df)
+                df = df[(df[col] > mean - 3*std) & (df[col] < mean + 3*std)]
+                outliers_removed += before_count - len(df)
+
+    if outliers_removed > 0:
+        print(f"Removed {outliers_removed} outlier values")
+
+    # Правильная нормализация без утечки данных
+    scaler = StandardScaler()
+    indicator_cols = ['RSI_15', 'BB_15_upper', 'BB_15_lower', 'ATR_15', 'OBV', 'AD', 'MFI_15']
+    available_indicators = [col for col in indicator_cols if col in df.columns]
+    if available_indicators:
+        df[available_indicators] = scaler.fit_transform(df[available_indicators])
+        print(f"Normalized {len(available_indicators)} indicator columns")
+
+    print(f"Preprocessing complete: {len(df)} final rows")
+    return df
+
+def train_rl_agent(data_path, total_timesteps=200000, eval_freq=10000, n_envs=8):
     """
-    Custom trading environment for RL agent
-    """
-    def __init__(self, df, initial_balance=10000, transaction_fee=0.0018):
-        super(TradingEnvironment, self).__init__()
+    Train RL agent using PPO with parallel environments
 
-        self.df = df.reset_index(drop=True)
-        self.initial_balance = initial_balance
-        self.transaction_fee = transaction_fee
-        self.current_step = 0
-
-        # Margin trading parameters
-        self.margin_requirement = 0.5  # 50% initial margin for shorts
-        self.maintenance_margin = 0.25  # 25% maintenance margin
-        self.liquidation_penalty = 0.02  # 2% penalty on liquidation
-
-        # Trailing stop-loss parameters
-        self.trailing_stop_distance = 0.03  # 3% trailing distance
-        self.trailing_stop_enabled = True
-
-        # Calculate dynamic price normalization based on data
-        price_col = 'close' if 'close' in df.columns else 'Close'
-        self.price_mean = df[price_col].mean()
-        self.price_std = df[price_col].std()
-        print(f"Price normalization: mean={self.price_mean:.2f}, std={self.price_std:.2f}")
-        print(f"Margin requirements: initial={self.margin_requirement*100:.0f}%, maintenance={self.maintenance_margin*100:.0f}%")
-        print(f"Trailing stop-loss: {self.trailing_stop_distance*100:.1f}% distance")
-
-        # Actions: 0=Hold, 1=Buy Long, 2=Sell Long, 3=Sell Short, 4=Buy Short
-        self.action_space = spaces.Discrete(5)
-
-        # State: [balance_norm, position_norm, price_norm, indicators...]
-        n_indicators = 7
-        self.observation_space = spaces.Box(
-            low=-np.inf, high=np.inf,
-            shape=(3 + n_indicators,), dtype=np.float32
-        )
-
-        self.reset()
-
-    def reset(self, seed=None, options=None):
-        self.current_step = 0
-        self.balance = self.initial_balance
-        self.position = 0  # 0=no position, positive=long, negative=short
-        self.total_fees = 0
-        self.portfolio_values = [self.initial_balance]
-
-        # Trailing stop-loss tracking
-        self.entry_price = 0
-        self.highest_price_since_entry = 0
-        self.lowest_price_since_entry = float('inf')
-        self.trailing_stop_loss = 0
-        self.trailing_take_profit = 0
-
-        return self._get_state(), {}
-
-    def _get_state(self):
-        """Get current state observation"""
-        if self.current_step >= len(self.df):
-            return np.zeros(self.observation_space.shape)
-
-        row = self.df.iloc[self.current_step]
-
-        # Normalize values
-        balance_norm = self.balance / self.initial_balance - 1
-        # Normalize position: positive for long, negative for short
-        # Use abs() to handle both long and short positions
-        if self.balance > 0:
-            position_norm = self.position / (self.balance * 0.1)
-        else:
-            position_norm = 0
-        current_price = row.get('close', row.get('Close', self.price_mean))  # Support both naming conventions
-        price_norm = (current_price - self.price_mean) / self.price_std  # Dynamic z-score normalization
-
-        # Technical indicators (removed MACD as it's not calculated in feature_engineer.py)
-        indicators = [
-            row.get('RSI_15', 50) / 100 - 0.5,  # RSI normalized to [-0.5, 0.5]
-            (row.get('BB_15_upper', current_price) / current_price - 1) if current_price > 0 else 0,  # BB upper as % deviation
-            (row.get('BB_15_lower', current_price) / current_price - 1) if current_price > 0 else 0,  # BB lower as % deviation
-            row.get('ATR_15', 100) / 1000,  # ATR normalized
-            row.get('OBV', 0) / 1e10,  # OBV normalized
-            row.get('AD', 0) / 1e10,  # AD normalized
-            row.get('MFI_15', 50) / 100 - 0.5  # MFI normalized to [-0.5, 0.5]
-        ]
-
-        state = np.array([balance_norm, position_norm, price_norm] + indicators, dtype=np.float32)
-        return state
-
-    def step(self, action):
-        """Execute one step in environment"""
-        if self.current_step >= len(self.df) - 1:
-            terminated = True
-            truncated = False
-            reward = 0
-            return self._get_state(), reward, terminated, truncated, {}
-
-        # Support both 'close' and 'Close' column names
-        current_price = self.df.iloc[self.current_step].get('close', self.df.iloc[self.current_step].get('Close'))
-        next_price = self.df.iloc[self.current_step + 1].get('close', self.df.iloc[self.current_step + 1].get('Close'))
-
-        reward = 0
-        terminated = False
-        truncated = False
-
-        # Check for margin call / liquidation before executing action
-        current_portfolio = self.balance + self.position * current_price
-        
-        # Only check margin for short positions (long positions don't use margin in this model)
-        if self.position < 0:  # Short position
-            position_value = abs(self.position) * current_price
-            margin_used = position_value * self.margin_requirement
-            
-            # Check maintenance margin: equity must be >= position_value * maintenance_margin
-            # Equity = portfolio value - margin_used (simplified)
-            # For shorts: if portfolio drops too much, we need to liquidate
-            required_equity = position_value * self.maintenance_margin
-            
-            if current_portfolio < required_equity:
-                # Liquidation triggered for short position
-                print(f"💥 LIQUIDATION: Portfolio ${current_portfolio:.2f} < Required ${required_equity:.2f}")
-
-                # Force close short position with penalty
-                cost = abs(self.position) * current_price * (1 + self.liquidation_penalty)
-                # If balance insufficient, use all available balance (partial liquidation)
-                if self.balance >= cost:
-                    self.balance -= cost + (cost * self.transaction_fee)
-                    self.total_fees += cost * self.transaction_fee
-                    self.position = 0
-                else:
-                    # Partial liquidation: close as much as possible
-                    max_cover = self.balance / (current_price * (1 + self.liquidation_penalty + self.transaction_fee))
-                    if max_cover > 0:
-                        cost_partial = max_cover * current_price * (1 + self.liquidation_penalty)
-                        self.balance -= cost_partial + (cost_partial * self.transaction_fee)
-                        self.total_fees += cost_partial * self.transaction_fee
-                        self.position += max_cover  # Reduce short position
-                        print(f"⚠️ Partial liquidation: closed {max_cover:.6f} of {abs(self.position):.6f} short position")
-
-                reward -= 50  # Heavy penalty for liquidation
-                print(f"🔥 Position liquidated with penalty")
-        
-        # For long positions, check if portfolio value drops too low (simple stop-loss)
-        elif self.position > 0:
-            if current_portfolio < self.initial_balance * 0.3:  # 70% loss
-                # Force close long position (stop-loss)
-                revenue = self.position * current_price * (1 - self.liquidation_penalty)
-                self.balance += revenue - (revenue * self.transaction_fee)
-                self.total_fees += revenue * self.transaction_fee
-                self.position = 0
-                reward -= 30  # Penalty for stop-loss
-                print(f"🛑 Stop-loss triggered: Long position closed")
-
-        # Update trailing stops for existing positions
-        if self.trailing_stop_enabled and self.position != 0:
-            if self.position > 0:  # Long position
-                # Update highest price since entry
-                if current_price > self.highest_price_since_entry:
-                    self.highest_price_since_entry = current_price
-                    # Update trailing stop-loss (3% below highest price)
-                    self.trailing_stop_loss = self.highest_price_since_entry * (1 - self.trailing_stop_distance)
-
-                # Check trailing stop-loss
-                if current_price <= self.trailing_stop_loss:
-                    # Trailing stop triggered - close long position
-                    revenue = self.position * current_price
-                    fee = revenue * self.transaction_fee
-                    self.balance += revenue - fee
-                    self.total_fees += fee
-
-                    pnl = (current_price - self.entry_price) * self.position - fee
-                    print(f"🎯 Trailing stop triggered: Long closed at ${current_price:.2f}, PnL: ${pnl:.2f}")
-
-                    self.position = 0
-                    self.entry_price = 0
-                    self.highest_price_since_entry = 0
-                    self.trailing_stop_loss = 0
-
-                    reward += 2  # Small bonus for disciplined exit
-                    # Skip normal action processing
-                    self.portfolio_values.append(self.balance + self.position * current_price)
-                    self.current_step += 1
-                    return self._get_state(), reward, terminated, truncated, {}
-
-            elif self.position < 0:  # Short position
-                # Update lowest price since entry
-                if current_price < self.lowest_price_since_entry:
-                    self.lowest_price_since_entry = current_price
-                    # Update trailing stop-loss (3% above lowest price for shorts)
-                    self.trailing_stop_loss = self.lowest_price_since_entry * (1 + self.trailing_stop_distance)
-
-                # Check trailing stop-loss for shorts
-                if current_price >= self.trailing_stop_loss:
-                    # Trailing stop triggered - close short position
-                    cost = abs(self.position) * current_price
-                    fee = cost * self.transaction_fee
-                    self.balance -= cost + fee
-                    self.total_fees += fee
-
-                    pnl = (self.entry_price - current_price) * abs(self.position) - fee
-                    print(f"🎯 Trailing stop triggered: Short closed at ${current_price:.2f}, PnL: ${pnl:.2f}")
-
-                    self.position = 0
-                    self.entry_price = 0
-                    self.lowest_price_since_entry = float('inf')
-                    self.trailing_stop_loss = 0
-
-                    reward += 2  # Small bonus for disciplined exit
-                    # Skip normal action processing
-                    self.portfolio_values.append(self.balance + self.position * current_price)
-                    self.current_step += 1
-                    return self._get_state(), reward, terminated, truncated, {}
-
-        # Execute action
-        if action == 1:  # Buy Long - открыть/добавить длинную позицию
-            if self.position < 0:
-                # Convert short to long: close short first, then open long
-                cover_amount = abs(self.position)
-                cost = cover_amount * current_price
-                fee = cost * self.transaction_fee
-
-                # Check if we can afford to close short AND open long
-                if self.balance >= cost + fee:
-                    # Estimate balance after closing short
-                    estimated_balance = self.balance - cost - fee
-                    # Check if we can open long position after closing short
-                    min_investment = current_price * (1 + self.transaction_fee) + 10
-
-                    if estimated_balance >= min_investment:
-                        # Close short - calculate PnL for conversion bonus
-                        pnl_short = (self.entry_price - current_price) * cover_amount - fee
-                        self.position = 0
-                        self.balance -= cost + fee
-                        self.total_fees += fee
-
-                        # Reset trailing stops
-                        self.entry_price = 0
-                        self.lowest_price_since_entry = float('inf')
-                        self.trailing_stop_loss = 0
-
-                        # Now open long position
-                        invest_amount = min(self.balance * 0.1, self.balance - 100)
-                        if invest_amount > 10:
-                            fee_long = invest_amount * self.transaction_fee
-                            coins_bought = (invest_amount - fee_long) / current_price
-
-                            self.position += coins_bought
-                            self.balance -= invest_amount
-                            self.total_fees += fee_long
-
-                            # Initialize trailing stops for new long position
-                            self.entry_price = current_price
-                            self.highest_price_since_entry = current_price
-                            self.trailing_stop_loss = current_price * (1 - self.trailing_stop_distance)
-
-                            # Bonus for successful conversion
-                            conversion_bonus = 5 + (pnl_short * 0.1 if pnl_short > 0 else 0)
-                            reward += conversion_bonus
-                            print(f"🔄💰 Converted short to long: PnL ${pnl_short:.2f}, Bonus +{conversion_bonus:.1f}")
-                        else:
-                            # Short closed but can't open long - bonus for closing profitable short
-                            if pnl_short > 0:
-                                reward += 3
-                                print(f"🔄✅ Closed profitable short: PnL ${pnl_short:.2f}")
-                            else:
-                                reward -= 0.5  # Smaller penalty for partial conversion
-                    else:
-                        # Can't afford conversion - don't close short
-                        reward -= 1  # Penalty for failed conversion
-                else:
-                    reward -= 1  # Penalty for failed conversion
-
-            elif self.position >= 0:
-                # Normal long buy
-                if self.balance > current_price * (1 + self.transaction_fee):
-                    invest_amount = min(self.balance * 0.1, self.balance - 100)
-                    fee = invest_amount * self.transaction_fee
-                    coins_bought = (invest_amount - fee) / current_price
-
-                    # Initialize trailing stops for new position
-                    if self.position == 0:  # First long position
-                        self.entry_price = current_price
-                        self.highest_price_since_entry = current_price
-                        self.trailing_stop_loss = current_price * (1 - self.trailing_stop_distance)
-
-                    self.position += coins_bought
-                    self.balance -= invest_amount
-                    self.total_fees += fee
-
-                    reward -= 0.01
-
-        elif action == 2:  # Sell Long - закрыть часть длинной позиции
-            if self.position > 0:
-                sell_amount = min(self.position * 0.5, self.position)
-                revenue = sell_amount * current_price
-                fee = revenue * self.transaction_fee
-
-                self.position -= sell_amount
-                self.balance += revenue - fee
-                self.total_fees += fee
-
-                reward -= 0.01
-
-        elif action == 3:  # Sell Short - открыть короткую позицию
-            if self.position > 0:
-                # Convert long to short: close long first, then open short
-                sell_amount = self.position
-                revenue = sell_amount * current_price
-                fee = revenue * self.transaction_fee
-
-                # Calculate PnL for conversion bonus
-                pnl_long = (current_price - self.entry_price) * sell_amount - fee
-
-                self.position = 0  # Close long
-                self.balance += revenue - fee
-                self.total_fees += fee
-
-                # Reset trailing stops
-                self.entry_price = 0
-                self.highest_price_since_entry = 0
-                self.trailing_stop_loss = 0
-
-                # Now open short position
-                short_value = min(self.balance * 0.1, self.balance - 100)
-                margin_required = short_value * self.margin_requirement
-                fee_short = short_value * self.transaction_fee
-
-                if self.balance > margin_required + fee_short:
-                    coins_short = (short_value - fee_short) / current_price
-                    self.position -= coins_short
-                    self.balance += short_value - fee_short
-                    self.total_fees += fee_short
-
-                    # Initialize trailing stops for new short position
-                    self.entry_price = current_price
-                    self.lowest_price_since_entry = current_price
-                    self.trailing_stop_loss = current_price * (1 + self.trailing_stop_distance)
-
-                    # Bonus for successful conversion
-                    conversion_bonus = 5 + (pnl_long * 0.1 if pnl_long > 0 else 0)
-                    reward += conversion_bonus
-                    print(f"🔄💰 Converted long to short: PnL ${pnl_long:.2f}, Bonus +{conversion_bonus:.1f}")
-                else:
-                    # Long closed but can't open short - bonus for closing profitable long
-                    if pnl_long > 0:
-                        reward += 3
-                        print(f"🔄✅ Closed profitable long: PnL ${pnl_long:.2f}")
-                    else:
-                        reward -= 0.5  # Smaller penalty for partial conversion
-
-            elif self.position <= 0:
-                # Normal short sell
-                short_value = min(self.balance * 0.1, self.balance - 100)
-                margin_required = short_value * self.margin_requirement
-                fee = short_value * self.transaction_fee
-
-                if self.balance > margin_required + fee:
-                    coins_short = (short_value - fee) / current_price
-                    self.position -= coins_short
-                    self.balance += short_value - fee
-                    self.total_fees += fee
-
-                    # Initialize trailing stops for new position
-                    if self.position == -coins_short:  # First short position
-                        self.entry_price = current_price
-                        self.lowest_price_since_entry = current_price
-                        self.trailing_stop_loss = current_price * (1 + self.trailing_stop_distance)
-
-                    reward -= 0.01
-
-        elif action == 4:  # Buy Short - закрыть короткую позицию (cover short)
-            if self.position < 0:
-                cover_amount = min(abs(self.position) * 0.5, abs(self.position))
-                cost = cover_amount * current_price
-                fee = cost * self.transaction_fee
-
-                if self.balance >= cost + fee:
-                    self.position += cover_amount
-                    self.balance -= cost + fee
-                    self.total_fees += fee
-
-                    reward -= 0.01
-
-        # Calculate reward based on portfolio change with risk adjustment
-        current_portfolio = self.balance + self.position * current_price
-        next_portfolio = self.balance + self.position * next_price
-
-        portfolio_change = (next_portfolio - current_portfolio) / current_portfolio if current_portfolio > 0 else 0
-
-        # Risk-adjusted reward: portfolio return minus volatility penalty
-        # Calculate rolling volatility (simplified Sharpe-like component)
-        if len(self.portfolio_values) >= 10:
-            recent_portfolio_values = self.portfolio_values[-10:]
-            returns = np.diff(recent_portfolio_values) / recent_portfolio_values[:-1]
-            volatility = np.std(returns) if len(returns) > 0 else 0
-            # Penalize high volatility (risk-adjusted component)
-            risk_penalty = volatility * 50  # Scale volatility penalty
-        else:
-            risk_penalty = 0
-
-        # Main reward: portfolio change scaled appropriately
-        # Scale by 10000 to make rewards more meaningful (0.1% change = 10 reward)
-        # This is important because minute-level price changes are very small
-        reward += (portfolio_change * 10000) - risk_penalty
-
-        # Reward for good trading decisions (updated for short positions)
-        price_change_pct = (next_price - current_price) / current_price if current_price > 0 else 0
-
-        # Long position rewards
-        if action == 1 and price_change_pct > 0:
-            reward += abs(price_change_pct) * 1000  # Bonus for correct long buy
-        if action == 1 and price_change_pct < 0:
-            reward -= abs(price_change_pct) * 500   # Penalty for wrong long buy
-        if action == 2 and price_change_pct < 0:
-            reward += abs(price_change_pct) * 1000  # Bonus for correct long sell
-        if action == 2 and price_change_pct > 0:
-            reward -= abs(price_change_pct) * 500   # Penalty for wrong long sell
-
-        # Short position rewards
-        if action == 3 and price_change_pct < 0:
-            reward += abs(price_change_pct) * 1000  # Bonus for correct short sell
-        if action == 3 and price_change_pct > 0:
-            reward -= abs(price_change_pct) * 500   # Penalty for wrong short sell
-        if action == 4 and price_change_pct > 0:
-            reward += abs(price_change_pct) * 1000  # Bonus for correct short cover
-        if action == 4 and price_change_pct < 0:
-            reward -= abs(price_change_pct) * 500   # Penalty for wrong short cover
-
-        # Penalty for holding too long without action
-        if action == 0:
-            if self.position != 0:  # Have position - small penalty
-                reward -= 0.005
-            else:  # No position - larger penalty to encourage action
-                reward -= 0.02
-
-        # Large penalty for going negative
-        if current_portfolio < self.initial_balance * 0.5:
-            reward -= 10
-
-        self.portfolio_values.append(current_portfolio)
-        self.current_step += 1
-
-        if self.current_step >= len(self.df) - 1:
-            terminated = True
-
-        return self._get_state(), reward, terminated, truncated, {}
-
-    def render(self, mode='human'):
-        """Render environment state"""
-        current_price = self.df.iloc[self.current_step].get('close', self.df.iloc[self.current_step].get('Close'))
-        portfolio_value = self.balance + self.position * current_price
-        print(f"Step: {self.current_step}, Balance: {self.balance:.2f}, Position: {self.position:.6f}, Portfolio: {portfolio_value:.2f}")
-
-def train_rl_agent(data_path, total_timesteps=100000, eval_freq=10000):
-    """
-    Train RL agent using PPO
-    
     Recommendations for timesteps:
     - Quick testing: 50,000 - 100,000 steps
-    - Development: 200,000 - 500,000 steps  
+    - Development: 200,000 - 500,000 steps
     - Production: 1,000,000 - 5,000,000 steps
-    
+
     Note: More timesteps generally lead to better performance, but diminishing returns
     after 1-2M steps for most trading tasks. The optimal depends on:
     - Complexity of the trading strategy
@@ -571,12 +247,15 @@ def train_rl_agent(data_path, total_timesteps=100000, eval_freq=10000):
     if missing_columns:
         raise ValueError(f"Missing required columns: {missing_columns}")
 
-    # Clean data
+    # Advanced data preprocessing
+    df = preprocess_data(df)
+
+    # Clean data (remove any remaining NaN)
     df = df.dropna()
     print(f"After dropping NaN: {len(df)} rows")
 
     if df.empty:
-        raise ValueError("All data was removed after dropping NaN values")
+        raise ValueError("All data was removed after preprocessing")
 
     # Check minimum data requirements for RL training
     if len(df) < 1000:
@@ -584,46 +263,71 @@ def train_rl_agent(data_path, total_timesteps=100000, eval_freq=10000):
 
     print(f"Final dataset: {len(df)} rows, {len(df.columns)} features")
 
-    print("Creating RL environment...")
-    env = DummyVecEnv([lambda: TradingEnvironment(df)])
+    print(f"Creating {n_envs} parallel RL environments...")
+    # Create parallel environments using SubprocVecEnv
+    envs = [make_env(df, i) for i in range(n_envs)]
+    env = SubprocVecEnv(envs)
 
     print("Creating PPO model...")
+    # Оптимизированные параметры PPO для прибыльной торговли
     model = PPO(
         "MlpPolicy",
         env,
-        learning_rate=3e-4,
-        n_steps=2048,
-        batch_size=64,
-        n_epochs=10,
-        gamma=0.99,
-        gae_lambda=0.95,
-        clip_range=0.2,
-        ent_coef=0.01,
-        vf_coef=0.5,
-        max_grad_norm=0.5,
+        learning_rate=get_linear_fn(0.0003, 0.00001, 0.1),  # Медленнее уменьшение LR
+        n_steps=4096,  # Больше шагов для лучшего обучения
+        batch_size=128,  # Больший размер батча
+        n_epochs=20,  # Больше эпох обучения
+        gamma=0.995,  # Более длинный горизонт планирования
+        gae_lambda=0.98,  # Лучшая оценка преимущества
+        clip_range=get_linear_fn(0.3, 0.1, 0.2),  # Более широкий clip range
+        ent_coef=0.005,  # Меньше случайности для фокусировки
+        vf_coef=0.8,  # Больше внимания к value function
+        max_grad_norm=0.3,  # Меньше ограничение градиентов
         verbose=1,
-        tensorboard_log="./rl_tensorboard/"
+        tensorboard_log="./rl_tensorboard/",
+        policy_kwargs=dict(
+            net_arch=dict(pi=[512, 256, 128], vf=[512, 256, 128]),  # Более мощная архитектура
+            activation_fn=torch.nn.ReLU
+        )
     )
 
-    # Evaluation callback - use subset of data for faster evaluation
-    # Use last 10% of data for evaluation (much faster than full dataset)
-    # This prevents the massive slowdown you experienced (TPS dropped from 180 to 12)
-    eval_df = df.tail(max(1000, len(df) // 10)).reset_index(drop=True)
-    eval_env = DummyVecEnv([lambda: Monitor(TradingEnvironment(eval_df), "./rl_logs/")])
+    # Evaluation callback - use different data slices for each evaluation episode
+    # This provides more diverse evaluation and better assessment of generalization
+    eval_data_size = max(1000, len(df) // 10)
+    eval_count = 0
+
+    def make_eval_env():
+        nonlocal eval_count
+        eval_count += 1
+        # Use systematic different slices for each evaluation to avoid identical results
+        max_start = len(df) - eval_data_size
+        if max_start > 0:
+            start_idx = (eval_count - 1) * (max_start // 10) % (max_start + 1)
+        else:
+            start_idx = 0
+        eval_df = df.iloc[start_idx:start_idx + eval_data_size].reset_index(drop=True)
+        # Create environment with unique ID to avoid monitor conflicts
+        env = TradingEnvironment(eval_df)
+        env.spec = type('Spec', (), {'id': f'TradingEnv_eval_{eval_count}'})()
+        return Monitor(env, "./rl_logs/")
+    
+    # Use SubprocVecEnv for evaluation to match training env type and avoid warnings
+    eval_env = SubprocVecEnv([make_eval_env])
     
     # Adjust eval frequency based on total timesteps
     # For longer training, evaluate less frequently to avoid slowdowns
     if total_timesteps > 500000:
-        actual_eval_freq = max(eval_freq, total_timesteps // 20)  # Max 20 evaluations
+        actual_eval_freq = max(eval_freq, total_timesteps // 100)  # Max 100 evaluations
     else:
         actual_eval_freq = eval_freq
     
-    eval_callback = EvalCallback(
-        eval_env,
+    eval_callback = EvaluationLoggerCallback(
+        log_file="rl_evaluation_log.txt",
+        eval_env=eval_env,
         best_model_save_path="./rl_models/",
         log_path="./rl_logs/",
         eval_freq=actual_eval_freq,
-        n_eval_episodes=1,  # Only 1 episode for faster evaluation
+        n_eval_episodes=1,  # Single episode per evaluation for cleaner monitor logs
         deterministic=True,
         render=False
     )
@@ -633,63 +337,307 @@ def train_rl_agent(data_path, total_timesteps=100000, eval_freq=10000):
         total_timesteps=total_timesteps,
         eval_freq=eval_freq
     )
+    
+    # Episode logger callback to track balance and PnL
+    #episode_logger = EpisodeLoggerCallback(log_file="rl_episode_log.txt")
 
-    print("Starting training...")
-    model.learn(
-        total_timesteps=total_timesteps,
-        callback=[progress_callback, eval_callback]
+    # Get environment to access parameters for display
+    env_instances = env.envs if hasattr(env, 'envs') else [env]
+    trading_env = env_instances[0]
+    if hasattr(trading_env, 'env'):
+        trading_env = trading_env.env
+
+    reward_clip_min, reward_clip_max = trading_env.reward_clip_bounds if hasattr(trading_env, 'reward_clip_bounds') else (-50, 50)
+    stop_loss_pct = int((1 - trading_env.termination_stop_loss_threshold) * 100) if hasattr(trading_env, 'termination_stop_loss_threshold') else 15
+
+    # Checkpoint callback for saving intermediate models
+    checkpoint_freq = max(50000, total_timesteps // 20)  # Save every 5% of training or every 50k steps
+    checkpoint_callback = CheckpointCallback(
+        save_freq=checkpoint_freq,
+        save_path="./rl_checkpoints/",
+        name_prefix="ppo_trading_agent",
+        save_replay_buffer=False,
+        save_vecnormalize=False,
     )
 
+    print("Starting training...")
+    print(f"Training configuration:")
+    print(f"  - Total timesteps: {total_timesteps:,}")
+    print(f"  - Parallel environments: {n_envs}")
+    print(f"  - Checkpoint frequency: {checkpoint_freq:,} timesteps")
+    print(f"  - Evaluation frequency: {actual_eval_freq:,} timesteps")
+    print(f"  - Learning rate: {model.learning_rate}")
+    print(f"  - Network architecture: [256, 256, 128]")
+    print(f"  - Reward clipping: [{reward_clip_min}, {reward_clip_max}]")
+    print(f"  - Conservative position sizing enabled")
+    print(f"  - Early termination at {stop_loss_pct}% portfolio loss")
+    print()
+
+    model.learn(
+        total_timesteps=total_timesteps,
+        callback=[progress_callback, eval_callback, checkpoint_callback],
+        progress_bar=True  # Show progress bar for long training
+    )
+
+    print("\n" + "="*60)
+    print("Training completed successfully!")
+    print("="*60)
     print("Saving final model...")
     model.save("ppo_trading_agent")
+    print("✅ Model saved to 'ppo_trading_agent.zip'")
+    print("\nNext steps:")
+    print("  1. Run paper trading: python rl_paper_trading.py")
+    print("  2. Check evaluation log: rl_evaluation_log.txt")
+    print("  3. Check episode log: rl_episode_log.txt")
+    print("  4. Monitor TensorBoard: tensorboard --logdir ./rl_tensorboard/")
 
     return model
 
-def evaluate_agent(model, data_path, n_episodes=5):
-    """Evaluate trained agent"""
-    print("Evaluating agent...")
+def calculate_max_drawdown(portfolio_values):
+    """Calculate maximum drawdown from portfolio values"""
+    if len(portfolio_values) < 2:
+        return 0.0
 
-    df = pd.read_csv(data_path)
-    df = df.dropna()
+    running_max = np.maximum.accumulate(portfolio_values)
+    drawdown = (portfolio_values - running_max) / running_max
+    return abs(drawdown.min())
 
-    env = TradingEnvironment(df)
+def calculate_sharpe_ratio(portfolio_values, risk_free_rate=0.0):
+    """Calculate Sharpe ratio from portfolio values"""
+    if len(portfolio_values) < 2:
+        return 0.0
 
-    episode_rewards = []
-    episode_portfolio_values = []
+    returns = np.diff(portfolio_values) / portfolio_values[:-1]
+    if len(returns) == 0 or np.std(returns) == 0:
+        return 0.0
 
-    for episode in range(n_episodes):
-        state, _ = env.reset()
+    excess_returns = returns - risk_free_rate
+    sharpe_ratio = np.mean(excess_returns) / np.std(excess_returns)
+
+    # Annualize (assuming daily returns)
+    return sharpe_ratio * np.sqrt(252)
+
+def validate_model_performance(model_path, validation_data_path):
+    """Валидация модели на отдельном наборе данных"""
+    print("🔍 Validating model performance...")
+
+    try:
+        model = PPO.load(model_path)
+        df = pd.read_csv(validation_data_path)
+        df = preprocess_data(df)
+
+        # Используем последние 20% данных для валидации
+        validation_size = len(df) // 5
+        validation_df = df.iloc[-validation_size:].reset_index(drop=True)
+
+        env = TradingEnvironment(validation_df)
+        obs, _ = env.reset()
         done = False
-        episode_reward = 0
-        portfolio_history = [env.initial_balance]
+        portfolio_values = [env.initial_balance]
+        trade_actions = 0
 
         while not done:
-            action, _ = model.predict(state, deterministic=True)
-            state, reward, terminated, truncated, _ = env.step(action)
+            action, _ = model.predict(obs, deterministic=True)
+            if not isinstance(action, (int, np.integer)):
+                action = 0
+            else:
+                action = np.clip(action, 0, env.action_space.n - 1)
+
+            obs, reward, terminated, truncated, _ = env.step(action)
             done = terminated or truncated
-            episode_reward += reward
-            current_price = df.iloc[min(env.current_step, len(df)-1)].get('close', df.iloc[min(env.current_step, len(df)-1)].get('Close'))
-            portfolio_history.append(env.balance + env.position * current_price)
 
-        episode_rewards.append(episode_reward)
-        episode_portfolio_values.append(portfolio_history)
+            # Подсчет торговых действий
+            if action in [1, 2, 3, 4]:
+                trade_actions += 1
 
-        final_portfolio = portfolio_history[-1]
-        profit = (final_portfolio - env.initial_balance) / env.initial_balance * 100
-        print(f"Episode {episode + 1}: Reward={episode_reward:.2f}, Final Portfolio=${final_portfolio:.2f}, Profit={profit:.2f}%")
+            current_price = validation_df.iloc[min(env.current_step, len(validation_df)-1)].get('close',
+                              validation_df.iloc[min(env.current_step, len(validation_df)-1)].get('Close'))
+            portfolio_value = env.balance + env.margin_locked + env.position * current_price
+            portfolio_values.append(portfolio_value)
 
-    # Plot average portfolio value
-    avg_portfolio = np.mean(episode_portfolio_values, axis=0)
-    plt.figure(figsize=(12, 6))
-    plt.plot(avg_portfolio)
-    plt.title('RL Agent Portfolio Value Over Time')
-    plt.xlabel('Steps')
-    plt.ylabel('Portfolio Value ($)')
-    plt.grid(True)
-    plt.savefig('rl_portfolio_performance.png')
-    plt.show()
+        # Расчет метрик валидации
+        total_return = (portfolio_values[-1] - env.initial_balance) / env.initial_balance
+        sharpe_ratio = calculate_sharpe_ratio(portfolio_values)
+        max_dd = calculate_max_drawdown(portfolio_values)
 
-    return episode_rewards, episode_portfolio_values
+        # Дополнительные метрики
+        returns = np.diff(portfolio_values) / portfolio_values[:-1]
+        volatility = np.std(returns) * np.sqrt(252) if len(returns) > 0 else 0
+        trade_frequency = trade_actions / len(portfolio_values) if len(portfolio_values) > 0 else 0
+
+        print(f"📊 Validation Results:")
+        print(f"   Total Return: {total_return*100:.2f}%")
+        print(f"   Sharpe Ratio: {sharpe_ratio:.2f}")
+        print(f"   Max Drawdown: {max_dd*100:.2f}%")
+        print(f"   Volatility: {volatility*100:.2f}%")
+        print(f"   Trade Frequency: {trade_frequency:.3f} trades/step")
+
+        # Комплексная оценка
+        score = 0
+        if total_return > 0:
+            score += 1
+        if sharpe_ratio > 0.5:
+            score += 1
+        if max_dd < 0.2:
+            score += 1
+        if volatility < 0.5:
+            score += 1
+
+        if score >= 3:
+            print("✅ Model PASSED validation")
+            return True
+        else:
+            print("❌ Model FAILED validation")
+            return False
+
+    except Exception as e:
+        print(f"Error during validation: {e}")
+        return False
+
+def evaluate_agent_comprehensive(model, data_path, n_episodes=10):
+    """Комплексная оценка агента с множественными метриками"""
+    print("🧪 Starting comprehensive agent evaluation...")
+    print(f"Evaluating on {n_episodes} random data slices")
+
+    df = pd.read_csv(data_path)
+    df = preprocess_data(df)  # Используем ту же предобработку что и в обучении
+
+    results = {
+        'returns': [],
+        'sharpe_ratios': [],
+        'max_drawdowns': [],
+        'win_rates': [],
+        'profit_factors': [],
+        'total_trades': [],
+        'portfolio_histories': []
+    }
+
+    for episode in range(n_episodes):
+        # Выбор случайного среза данных
+        eval_length = min(2000, len(df) // 3)  # До 2000 точек или 1/3 данных
+        start_idx = np.random.randint(0, max(1, len(df) - eval_length))
+        eval_df = df.iloc[start_idx:start_idx + eval_length].reset_index(drop=True)
+
+        env = TradingEnvironment(eval_df)
+        obs, _ = env.reset()
+        done = False
+        portfolio_history = [env.initial_balance]
+        trade_count = 0
+        winning_trades = 0
+        losing_trades = 0
+        gross_profit = 0
+        gross_loss = 0
+
+        while not done:
+            action, _ = model.predict(obs, deterministic=True)
+            if isinstance(action, (int, np.integer)):
+                action = np.clip(action, 0, env.action_space.n - 1)
+            else:
+                action = 0
+
+            obs, reward, terminated, truncated, _ = env.step(action)
+            done = terminated or truncated
+
+            # Track trades (all trading actions)
+            if action in [1, 2, 3, 4]:  # All trading actions
+                trade_count += 1
+
+            current_price = eval_df.iloc[min(env.current_step, len(eval_df)-1)].get('close', eval_df.iloc[min(env.current_step, len(eval_df)-1)].get('Close'))
+            portfolio_value = env.balance + env.margin_locked + env.position * current_price
+            portfolio_history.append(portfolio_value)
+
+        # Расчет метрик для эпизода
+        returns = [(portfolio_history[i] - portfolio_history[i-1]) / portfolio_history[i-1]
+                  for i in range(1, len(portfolio_history)) if portfolio_history[i-1] > 0]
+
+        total_return = (portfolio_history[-1] - env.initial_balance) / env.initial_balance
+
+        # Sharpe ratio (annualized, assuming daily returns)
+        if returns and np.std(returns) > 0:
+            sharpe_ratio = np.mean(returns) / np.std(returns) * np.sqrt(252)
+        else:
+            sharpe_ratio = 0
+
+        max_drawdown = calculate_max_drawdown(portfolio_history)
+
+        # Win rate (simplified - based on final return)
+        win_rate = 1.0 if total_return > 0 else 0.0
+
+        # Profit factor (simplified)
+        if gross_loss > 0:
+            profit_factor = gross_profit / gross_loss
+        else:
+            profit_factor = float('inf') if gross_profit > 0 else 1.0
+
+        results['returns'].append(total_return)
+        results['sharpe_ratios'].append(sharpe_ratio)
+        results['max_drawdowns'].append(max_drawdown)
+        results['win_rates'].append(win_rate)
+        results['profit_factors'].append(profit_factor)
+        results['total_trades'].append(trade_count)
+        results['portfolio_histories'].append(portfolio_history)
+
+        print(f"Episode {episode + 1}: Return={total_return*100:.2f}%, Sharpe={sharpe_ratio:.2f}, "
+              f"MaxDD={max_drawdown*100:.2f}%, Trades={trade_count}")
+
+    # Статистический анализ результатов
+    print("\n" + "="*60)
+    print("📊 COMPREHENSIVE EVALUATION RESULTS")
+    print("="*60)
+
+    print(f"Episodes evaluated: {n_episodes}")
+    print(f"Average Return: {np.mean(results['returns'])*100:.2f}% ± {np.std(results['returns'])*100:.2f}%")
+    print(f"Median Return: {np.median(results['returns'])*100:.2f}%")
+    print(f"Best Return: {np.max(results['returns'])*100:.2f}%")
+    print(f"Worst Return: {np.min(results['returns'])*100:.2f}%")
+    print()
+
+    print(f"Average Sharpe Ratio: {np.mean(results['sharpe_ratios']):.2f} ± {np.std(results['sharpe_ratios']):.2f}")
+    print(f"Average Max Drawdown: {np.mean(results['max_drawdowns'])*100:.2f}% ± {np.std(results['max_drawdowns'])*100:.2f}%")
+    print(f"Win Rate: {np.mean(results['win_rates'])*100:.1f}%")
+    print(f"Average Trades per Episode: {np.mean(results['total_trades']):.1f}")
+    print()
+
+    # Оценка общей производительности
+    avg_return = np.mean(results['returns'])
+    avg_sharpe = np.mean(results['sharpe_ratios'])
+    avg_drawdown = np.mean(results['max_drawdowns'])
+
+    if avg_return > 0.05 and avg_sharpe > 1.0 and avg_drawdown < 0.15:
+        assessment = "EXCELLENT - Ready for live trading!"
+    elif avg_return > 0.02 and avg_sharpe > 0.5:
+        assessment = "GOOD - Promising performance, needs optimization"
+    elif avg_return > 0:
+        assessment = "FAIR - Generates profit but needs improvement"
+    else:
+        assessment = "POOR - Needs significant retraining"
+
+    print(f"🎯 OVERALL ASSESSMENT: {assessment}")
+
+    # Сохранение детальных результатов
+    detailed_results = {
+        'summary': {
+            'episodes': n_episodes,
+            'avg_return': np.mean(results['returns']),
+            'std_return': np.std(results['returns']),
+            'avg_sharpe': np.mean(results['sharpe_ratios']),
+            'avg_drawdown': np.mean(results['max_drawdowns']),
+            'win_rate': np.mean(results['win_rates']),
+            'assessment': assessment
+        },
+        'detailed': results
+    }
+
+    with open('rl_comprehensive_evaluation.pkl', 'wb') as f:
+        pickle.dump(detailed_results, f)
+
+    print("📁 Detailed results saved to 'rl_comprehensive_evaluation.pkl'")
+
+    return detailed_results
+
+def evaluate_agent(model, data_path, n_episodes=5):
+    """Legacy evaluation function - now calls comprehensive evaluation"""
+    return evaluate_agent_comprehensive(model, data_path, n_episodes)
 
 if __name__ == "__main__":
     import argparse
@@ -697,8 +645,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train RL Trading Agent")
     parser.add_argument("--data", default="btc_usdt_training_data/full_btc_usdt_data_feature_engineered.csv",
                        help="Path to training data")
-    parser.add_argument("--timesteps", type=int, default=500000,
-                       help="Total training timesteps (default: 500000. For production: 1M-5M recommended)")
+    parser.add_argument("--timesteps", type=int, default=2000000,
+                       help="Total training timesteps")
+    parser.add_argument("--n_envs", type=int, default=8,
+                       help="Number of parallel environments")
     parser.add_argument("--eval", action="store_true",
                        help="Evaluate trained agent")
 
@@ -706,8 +656,12 @@ if __name__ == "__main__":
 
     if args.eval:
         print("Loading trained model...")
-        model = PPO.load("ppo_trading_agent")
-        evaluate_agent(model, args.data)
+        try:
+            model = PPO.load("ppo_trading_agent")
+            evaluate_agent(model, args.data)
+        except Exception as e:
+            print(f"Error loading model: {e}")
+            exit(1)
     else:
-        model = train_rl_agent(args.data, args.timesteps)
+        model = train_rl_agent(args.data, args.timesteps, n_envs=args.n_envs)
         print("Training completed. Use --eval to evaluate the agent.")

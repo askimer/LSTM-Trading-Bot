@@ -1,105 +1,263 @@
-# Bitcoin Algorithmic Trading with LSTM and Pytorch
-This is my little project I made because I was interested in algorithmic trading and machine learning.
-Essentially It uses a LSTM neural network to predict the price of bitcoin. Then it uses the predicted price plus some indicators to decide whether to buy or sell bitcoin.
-This bot is meant to trade one specific currency pair for simplicity's sake.
+# RL Algorithmic Trading Bot
 
-The goal of this entire project is to learn about data pipelines, data science, machine learning and algorithmic trading. This is purely for educational purposes.
+A sophisticated reinforcement learning-based algorithmic trading system that uses Deep Q-Network (DQN) and Proximal Policy Optimization (PPO) algorithms to trade cryptocurrency markets.
 
-## Requirements
-Python 3.11 recommended. Unsure if it works with lower versions of python.
-First, pip install the requirements using `pip install -r requirements.txt`. This will install all the required packages.
+## 🚀 Features
 
-Then you must manually install `TA_Lib-0.4.24`. This is technical analysis library that I used for a key part of the bot.
-You should also manually install the correct version of `pytorch` for your system. You can find the correct version here: https://pytorch.org/get-started/locally/.
+- **Advanced RL Algorithms**: Implements both DQN and PPO for optimal trading strategies
+- **Multi-Asset Support**: Capable of trading various cryptocurrency pairs
+- **Comprehensive Risk Management**: Built-in stop-loss, take-profit, position sizing, and portfolio controls
+- **Real-time Trading**: Supports live trading with virtual/paper trading modes
+- **Advanced Technical Analysis**: Incorporates 30+ technical indicators for decision making
+- **Hyperparameter Optimization**: Automated optimization using Optuna
+- **Performance Analytics**: Comprehensive backtesting and live performance metrics
+- **Reproducible Results**: Fixed random seeds for consistent training outcomes
 
-## Usage
-1. Get second by second data from Binance using `get_new_dataset.bat`. This is a batch file that will run a few python scripts to fetch, clean and feature engineer the data.
-This data is stored in a csv file in a folder named `btc_usdt_data`. Rename this folder to `btc_usdt_training_data`. Do this 2 more times and rename the folders to `trading_alg_tuning_data` and `paper_trade_data`.
+## 📊 Trading Strategies
 
-You may have to adjust the time period in `get_price_data.py` to get the right amount data. I used 3 months of data for training, ~1 week for parameter tuning and about 3 weeks for paper trading. For context, my computer has 32 Gb of RAM and a 3070 ti GPU. Training on 4 months of data barely fits in memory.
+The system implements multiple trading strategies:
 
-2. Train the LSTM neural network using `train_model.py`. At the end, it will create a file named `lstm_model_{MSE}.pt` where `{MSE}` is the mean squared error of the model. This file will be used by the bot to predict prices.
+1. **Trend Following**: Identifies and follows market trends
+2. **Mean Reversion**: Capitalizes on price deviations from mean
+3. **Breakout Trading**: Exploits price breakouts from consolidation patterns
+4. **Momentum Trading**: Captures momentum-driven price movements
 
-3. Here I used a bit of manual work to tune the parameters of the trading algorithm. `strategy_tuning.py` is used to test different parameters and see which ones are the best based off of sharpe ratio. you may have to adjust the risk-free rate to calculate the correct sharpe ratio. This will output to console, the top 10 parameters based off of sharpe ratio, along with the profit and max drawdown. It also outputs the graph of the top 10 parameters' portfolio value against time. You can then keep searching and then choose your favourite one and use it in the next step in `paper_trading.py`. (Or completely ignore this step and use the parameters I used, the parameters may not be the best for all datasets).
+## 🏗️ Architecture
 
-4. Run `paper_trading.py` to see how the algorithm performs on unseen data. This will create a file named `lstm_vs_buy_and_hold.png` which shows the portfolio value of the algorithm vs buy and hold. You can see the results of the test there. In console, the sharpe ratio and max drawdown are printed.
+```
+rl-trading-bot/
+├── trading_environment.py      # Unified trading environment
+├── train_rl.py                # RL training module with reproducible seeds
+├── rl_paper_trading.py        # Paper trading simulation
+├── rl_live_trading.py         # Live trading module with improved error handling
+├── risk_management.py         # Advanced risk controls
+├── hyperparameter_optimization.py  # Hyperparameter tuning with logging
+├── data/
+│   ├── btc_usdt_data/         # Historical market data
+│   └── feature_engineered/    # Engineered features
+├── models/                    # Trained RL models
+├── notebooks/                 # Jupyter notebooks for analysis
+└── utils/                     # Utility functions
+```
 
-## Details about each file
-`get_new_dataset.bat`: Runs the python scripts to get the data from binance, clean it and feature engineer.
+## 📈 Technical Indicators
 
-`get_price_data.py`: Gets the price data from binance and saves it to a csv file. It specifically fetches the data for 1 second resolution BTC/USDT data. you can change the pair and data resolution. Check the binance api docs for more info.
+The system incorporates 30+ technical indicators:
 
-`clean_data.py`: Cleans the data. rows with missing data and useless columns. It then saves the data to a csv file.
+- **Trend Indicators**: Moving Averages (EMA, WMA), MACD, ADX
+- **Momentum Indicators**: RSI, Stochastic Oscillator, ROC, Williams %R
+- **Volatility Indicators**: Bollinger Bands, ATR, Keltner Channels
+- **Volume Indicators**: OBV, AD, MFI, VPT
+- **Pattern Recognition**: Candlestick patterns, support/resistance levels
 
-`feature_engineering.py`: Adds features to the data. It adds EMA, BB, RSI, ULTOSC, OBV, AD, ATR, WCLPRICE, HT_DCPERIOD, VAR, and MFI of 3 different time periods (if applicable). It then saves the data to a csv file.
+## 🎯 RL Implementation
 
-`train_model.py`: Trains the LSTM neural network. It will use hyperparameter search to find the best parameters for the model. It uses the data in `btc_usdt_training_data` to train the model. It will then save the model to a file named `lstm_model_{MSE}.pt` where `{MSE}` is the mean squared error of the model on a subset of `btc_usdt_training_data`. 
+### DQN (Deep Q-Network)
+- Deep neural network with experience replay
+- Double DQN with Dueling architecture
+- Prioritized Experience Replay for efficient learning
 
-`strategy_tuning.py`: Tests different parameters for the trading algorithm. Uses a simulated trade environment to test the parameters, as realistic as I can make it. It will use the data in `trading_alg_tuning_data` to test the algorithm. It will then print the top 10 parameters based off of sharpe ratio, along with the profit and max drawdown. It also outputs the graph of the top 10 parameters' portfolio value against time.
+### PPO (Proximal Policy Optimization)
+- Actor-Critic architecture with shared feature extractor
+- Clipped surrogate objective for stable training
+- Adaptive learning rate scheduling
 
-`paper_trading.py`: Tests the algorithm on unseen data in a similar trade environment. It will use the data in `paper_trade_data` to test the algorithm. It will then print the sharpe ratio and max drawdown of the algorithm. It will also output the graph of the portfolio value against time.
+## 🛡️ Risk Management
 
-## My results
-So I used the data from October 1st, 2023 until the end of December 17th, 2023 for training. December 18th to December 26th for parameter tuning. December 27th to January 17th for paper trading. 
+Comprehensive risk controls:
 
-My optimal model had a MSE of 1472 which took about a week to train and tune. It ended up being a 4 layer LSTM with 1 final linear output layer. It has 512 hidden units per layer, using a learning rate of 0.01, a batch size of 192.
+- **Position Sizing**: Dynamic position sizing based on volatility and risk tolerance
+- **Stop Loss**: Trailing stop-loss with adaptive distances
+- **Take Profit**: Dynamic take-profit levels
+- **Correlation Limits**: Maximum correlation between positions
+- **Exposure Limits**: Individual and total portfolio exposure caps
+- **Drawdown Control**: Automatic trading halt on excessive drawdown
+- **Volatility Limits**: Position reduction during high volatility periods
 
-Tuning the algorithmic trading bot also took about another week to fine tune. I did this twice because the result I ended up with the first time didn't meet my expectations.
-Below is a plot of 10 random hyperparameters.
-![tuning results](./tuning_strategy.png)
+## 📊 Performance Metrics
 
-Eventually, I managed to tune the results much more tightly. Shown below is the plot of the top 10 hyperparameters in the final round of tuning.
-![tuning results part 2](./tuning_strategy_results.png)
+The system tracks multiple performance metrics:
 
-It had a net profit of +189.02 or 1.89%, a sharpe_ratio of 0.0343 and a max_drawdown of -1.26% over the test period. 
-Compared to a simple buy and hold strategy which actually lost a bit of money over the test period with a loss of -0.25%.
+- **Return Metrics**: Total return, annualized return, cumulative return
+- **Risk-Adjusted Metrics**: Sharpe ratio, Sortino ratio, Calmar ratio
+- **Risk Metrics**: Value at Risk (VaR), Expected Shortfall (ES), Maximum drawdown
+- **Efficiency Metrics**: Profit factor, Win rate, Average trade duration
+- **Correlation Metrics**: Beta, Alpha, Information ratio
 
-This tuning was done in an environment assuming a trading fee of 0.18% per trade. This is the fee that Binance charges for spot trading with a really high volume.
-I also derived the risk free rate of 0.0006811% per 1000 seconds from the 3 month US treasury bill yield.
+## 🚀 Getting Started
 
-The Paper trading was tested in the in a similar environment with the optimal parameters found earlier. 
-![Paper trading results](./lstm_vs_buy_and_hold_normal.png)
+### Prerequisites
 
-The algorithmic trading bot had a net profit of 2.702% and a sharpe ratio of 0.0222 and a max drawdown of 0.613% over the paper trading period.
-The buy and hold strategy which had a net profit of 0.68% and a sharpe ratio of 0.000684 and a max drawdown of -14.21% over the paper trading period.
+- Python 3.11+
+- UV package manager (recommended)
 
-### Further Testing
+### Installation
 
-So lets try testing the algorithmic trading bot in a bull market and a bear market. I will use the same parameters as before.
-(Bull market, March 11, 2023 to March 18, 2023)
-![Paper trading results in bull market](./lstm_vs_buy_and_hold_bull.png)
+```bash
+# Clone the repository
+git clone https://github.com/yourusername/rl-trading-bot.git
+cd rl-trading-bot
 
-Meh results for the bull market. It earned half as much as simply buying and holding! still has a lower drawdown and higher sharpe ratio though. Arguably better risk management.
-LSTM        : Net profit: 16.81%, Sharpe ratio: 0.0659851, Max drawdown: -0.06478%
-Buy and hold: Net profit: 32.96%, Sharpe ratio: 0.0084906, Max drawdown: -0.08566%
+# Install dependencies using UV (recommended)
+uv sync
 
-(Bear market, May 6, 2021 to May 21, 2021)
-![Paper trading results in bear market](./lstm_vs_buy_and_hold_bear.png)
-Much better results here for a bear market. It is very good at wealth preservation. It has a significantly lower drawdown and higher sharpe ratio than buy and hold!
-These downturns are where the bot shines. It is able to avoid large losses and maintain a consistent performance.
+# Or if UV is not available, use pip
+pip install -r requirements.txt
 
-LSTM        : Net profit:- 0.18%, Sharpe ratio:-0.0011961, Max drawdown: -0.09947%
-Buy and hold: Net profit:-33.88%, Sharpe ratio:-0.0357828, Max drawdown: -0.43565%
+# Install PyTorch and Stable-Baselines3 separately based on your platform:
+# For Linux/macOS with CPU:
+pip install torch torchvision torchaudio
+pip install stable-baselines3[extra]
 
-## Conclusions
+# For Linux/macOS with CUDA (select appropriate version):
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+pip install stable-baselines3[extra]
 
-### Net Profit
-The algorithmic trading bot out performed the buy and hold strategy in terms of net profit, sharpe ratio and max drawdown.
-Comparing net profit, the trading bot made 4 times more profit than the buy and hold strategy! This of course means that the bot is much more profitable than the buy and hold strategy and it can generate more returns over the trading period.
+# For macOS with ARM64 (Apple Silicon):
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+pip install stable-baselines3[extra]
+```
 
-### Sharpe Ratio
-The sharpe ratio is a measure of risk-adjusted return. The bot's Sharpe ratio of 0.0222 is significantly higher than the buy and hold strategy's sharpe ratio of 0.000684. What this means is that the bot has a more efficient risk management strategy. It is able to generate more returns per unit of risk than the buy and hold strategy.
+### Environment Setup
 
-### Max Drawdown
-The max drawdown is a measure of the largest drop in the portfolio value from a peak to a trough. The bot's max drawdown of 0.613% is significantly lower than the buy and hold strategy's max drawdown of -14.21%. This means that the bot is able to better manage risk and avoid large losses.
+Before running the live trading bot, set up your API keys in the `.env` file:
 
-### Overall Risk Management
-The combination of a higher Sharpe ratio and a much lower max drawdown means that not only is the bot much more profitable than buying and holding, but also managed risk more effectively. Looking at the graph of the portfolio value over time, we can see that the bot is able to avoid large dips in prices (most notably at around the 600s and 1400s mark). However, it seems to miss out on some of the large jumps in value that the buy and hold strategy was able to capture (and then lose). The bot appears to have maintained a more consistent performance with less volatility and smaller losses.
+```bash
+# Copy the template
+cp .env.example .env
 
-Here are the results one more time.
-![Paper trading results again](./lstm_vs_buy_and_hold.png)
+# Edit the file with your API keys
+nano .env
+```
 
-### Time Period, Market Context and Real World Application
-These numbers show the bot's superiority in the tested specific period of time. However, these numbers are based on a fairly simplified trading environment and doesn't take into account slippage and market impact of large orders, as well as different time periods. It is possible that this trading bot doesn't perform well in the real world markets but that is fine for this project. Those could be things I account for and improve on in the future. Maybe I could learn how to model slippage.
+⚠️ **Security Warning**: Never commit your actual API keys to version control. The `.env` file is already included in `.gitignore`.
 
-The goal of this project was to learn about algorithmic trading and machine learning. I have learned a lot about both of these topics and I am happy with the results of this project!
+### Data Preparation
+
+1. Download historical market data (CSV format) for your preferred assets
+2. Place data in `data/` directory
+3. Run feature engineering:
+
+```bash
+python scripts/feature_engineering.py --data data/btc_usdt_historical.csv
+```
+
+### Training
+
+```bash
+# Train PPO model with reproducible results
+python -m train_rl train ppo --data data/btc_usdt_feature_engineered.csv --timesteps 1000000
+
+# Optimize hyperparameters
+python -m hyperparameter_optimization --n_trials 100
+```
+
+### Paper Trading
+
+```bash
+# Run paper trading simulation
+python -m rl_paper_trading --model models/dqn_trained.zip --data data/btc_usdt_test.csv --balance 10000
+```
+
+### Live Trading
+
+```bash
+# Run live trading (virtual mode)
+python -m rl_live_trading --model models/ppo_trained.zip --symbol BTC-USDT --balance 10000 --test-mode
+```
+
+## 📊 Model Performance
+
+### Evaluation Metrics
+
+| Metric | Description |
+|--------|-------------|
+| Total Return | Overall percentage return |
+| Sharpe Ratio | Risk-adjusted return |
+| Maximum Drawdown | Largest peak-to-trough decline |
+| Win Rate | Percentage of profitable trades |
+| Profit Factor | Gross profit / Gross loss |
+| Expectancy | Average profit per trade |
+
+### Baseline Comparison
+
+The RL model is compared against:
+
+- Buy & Hold strategy
+- Simple moving average crossover
+- RSI-based strategy
+- Random walk benchmark
+
+## 🔧 Configuration
+
+Configuration parameters can be adjusted in `config/trading_config.yaml`:
+
+```yaml
+# Trading Parameters
+initial_balance: 10000
+transaction_fee: 0.001
+max_position_size: 0.25
+max_total_exposure: 0.50
+
+# Risk Management
+stop_loss_pct: 0.08
+take_profit_pct: 0.15
+max_drawdown_limit: 0.20
+max_volatility_limit: 0.50
+
+# RL Parameters
+learning_rate: 0.0003
+batch_size: 128
+buffer_size: 100000
+exploration_fraction: 0.1
+```
+
+## 📈 Monitoring
+
+The system provides real-time monitoring through:
+
+- Console logging with key metrics
+- TensorBoard integration for training visualization
+- Performance dashboards
+- Risk alerts and notifications
+
+## 🧪 Testing
+
+Run tests to verify system functionality:
+
+```bash
+# Run unit tests
+python -m pytest tests/unit/
+
+# Run integration tests
+python -m pytest tests/integration/
+
+# Run performance tests
+python -m pytest tests/performance/
+```
+
+## 🤝 Contributing
+
+1. Fork the repository
+2. Create a feature branch (`git checkout -b feature/amazing-feature`)
+3. Commit your changes (`git commit -m 'Add amazing feature'`)
+4. Push to the branch (`git push origin feature/amazing-feature`)
+5. Open a Pull Request
+
+## 📄 License
+
+This project is licensed under the MIT License - see the LICENSE file for details.
+
+## ⚠️ Disclaimer
+
+**This is a research project for educational purposes. Trading cryptocurrencies involves substantial risk and may not be suitable for all investors. Past performance does not guarantee future results. Never invest more than you can afford to lose.**
+
+The authors are not responsible for any financial losses incurred through the use of this software.
+
+## 📞 Support
+
+For support, please open an issue in the GitHub repository or contact the maintainers.
+
+---
+
+**Happy Trading!** 📈

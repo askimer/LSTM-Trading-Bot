@@ -1,5 +1,106 @@
-btc_usdt_training_data
-paper_trade_*
-trading_alg_tuning_data
-lstm_model_1472.pt
-scaler.pkl
+# Dependencies
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+ENV/
+.venv/
+env.bak/
+venv.bak/
+
+# Virtual Environment
+.venv/
+venv/
+env/
+
+# Project-specific
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Logs
+*.log
+logs/
+*.out
+
+# Models
+*.pt
+*.pth
+*.ckpt
+models/
+
+# Data
+*.csv
+*.json
+*.pickle
+*.pkl
+data/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Environment specific
+.env
+.env.local
+.env.*.local
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Artifacts
+*.egg-info/
+dist/
+build/
+*.so
+
+# Local config
+config/local_settings.py
+
+# Temporary files
+tmp/
+temp/
+
+# Backup files
+*.bak
+*.backup
+
+# Secrets and credentials
+secrets/
+credentials.json
+private.key
+*.pem
+*.key
+id_rsa
+id_rsa.pub
+
+# Training artifacts
+runs/
+tensorboard/
+checkpoints/
+rl_tensorboard/
+rl_models/
+rl_checkpoints/
+rl_logs/
+
+# Dataset cache
+.cache/
+
+# IDE specific
+.vscode/
+.idea/
+
+# Trading specific sensitive files
+api_keys.json
+keys.json
+credentials.ini
