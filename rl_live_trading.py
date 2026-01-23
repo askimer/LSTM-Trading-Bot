@@ -1083,7 +1083,20 @@ class RLLiveTradingBot:
                 elapsed_minutes = (time.time() - session_start) / 60
                 if elapsed_minutes % 1 < 0.1:  # Log roughly every minute
                     pnl_pct = (self.cumulative_pnl / self.initial_balance) * 100
-                    logger.info(f"Session Progress: {elapsed_minutes:.1f}min | Portfolio: ${portfolio_value:.2f} | Balance: ${self.balance:.2f} | Long: {self.long_position:+.6f} BTC | Short: {self.short_position:+.6f} BTC | Net: {self.position:+.6f} BTC | Cumulative P&L: ${self.cumulative_pnl:+.2f} ({pnl_pct:+.2f}%) | Trades: {len(self.trades)}")
+                    
+                    # Calculate unrealized P&L for current positions
+                    long_unrealized_pnl = 0
+                    short_unrealized_pnl = 0
+                    if self.long_position > 0 and self.long_entry_price > 0:
+                        long_unrealized_pnl = (current_price - self.long_entry_price) * self.long_position
+                    if self.short_position > 0 and self.short_entry_price > 0:
+                        short_unrealized_pnl = (self.short_entry_price - current_price) * self.short_position
+                    
+                    total_unrealized_pnl = long_unrealized_pnl + short_unrealized_pnl
+                    total_realized_pnl = self.cumulative_pnl
+                    total_pnl = total_realized_pnl + total_unrealized_pnl
+                    
+                    logger.info(f"Session Progress: {elapsed_minutes:.1f}min | Portfolio: ${portfolio_value:.2f} | Balance: ${self.balance:.2f} | Long: {self.long_position:+.6f} BTC @${self.long_entry_price:.2f} (P&L: ${long_unrealized_pnl:+.2f}) | Short: {self.short_position:+.6f} BTC @${self.short_entry_price:.2f} (P&L: ${short_unrealized_pnl:+.2f}) | Net: {self.position:+.6f} BTC | Realized P&L: ${self.cumulative_pnl:+.2f} ({pnl_pct:+.2f}%) | Unrealized P&L: ${total_unrealized_pnl:+.2f} | Total P&L: ${total_pnl:+.2f} | Trades: {len(self.trades)}")
 
                 # Wait before next iteration (configurable interval)
                 time.sleep(check_interval_seconds)

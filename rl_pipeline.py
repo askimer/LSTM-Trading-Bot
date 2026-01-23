@@ -101,55 +101,48 @@ def evaluate_model():
     """Оценка обученной модели"""
     print("\n🔍 Оценка модели")
     print("=" * 50)
-    
+
     # Попробуем загрузить результаты комплексной оценки
     try:
         with open('rl_comprehensive_evaluation.pkl', 'rb') as f:
             results = pickle.load(f)
-        
+
         summary = results['summary']
         avg_return = summary.get('avg_return', 0)
         avg_sharpe = summary.get('avg_sharpe', 0)
         avg_drawdown = summary.get('avg_drawdown', 0)
-        
+
         print(f"Средняя доходность: {avg_return*100:.2f}%")
         print(f"Средний коэффициент Шарпа: {avg_sharpe:.4f}")
         print(f"Средняя максимальная просадка: {avg_drawdown*100:.2f}%")
-        
+
         return avg_return, avg_sharpe, avg_drawdown
     except FileNotFoundError:
-        print("❌ Файл результатов оценки не найден")
-        # Если файл не существует, запустим оценку
-        command = "python -c \"import sys; sys.path.append('.'); from train_rl import evaluate_agent_comprehensive; from stable_baselines3 import PPO; import pandas as pd; model = PPO.load('ppo_trading_agent'); df = pd.read_csv('btc_usdt_data/full_btc_usdt_data_feature_engineered.csv'); df = df.tail(2000).reset_index(drop=True); results = evaluate_agent_comprehensive(model, 'btc_usdt_data/full_btc_usdt_data_feature_engineered.csv', n_episodes=5); print('RESULTS:', results['summary'])\""
-        success, output = run_command(command, "Комплексная оценка модели")
-        
-        if success:
-            # Попробуем извлечь результаты из вывода
-            if 'RESULTS:' in output:
-                # Это сложный случай, так как результаты в stdout
-                # Для упрощения будем считать, что если команда успешна, 
-                # то результаты были сохранены в файл
-                try:
-                    with open('rl_comprehensive_evaluation.pkl', 'rb') as f:
-                        results = pickle.load(f)
-                    summary = results['summary']
-                    avg_return = summary.get('avg_return', 0)
-                    avg_sharpe = summary.get('avg_sharpe', 0)
-                    avg_drawdown = summary.get('avg_drawdown', 0)
-                    
-                    print(f"Средняя доходность: {avg_return*100:.2f}%")
-                    print(f"Средний коэффициент Шарпа: {avg_sharpe:.4f}")
-                    print(f"Средняя максимальная просадка: {avg_drawdown*100:.2f}%")
-                    
-                    return avg_return, avg_sharpe, avg_drawdown
-                except FileNotFoundError:
-                    print("❌ Не удалось загрузить результаты оценки")
-                    return 0, 0, 0
-            else:
-                print("❌ Не удалось извлечь результаты оценки из вывода")
-                return 0, 0, 0
-        else:
-            print("❌ Оценка модели не удалась")
+        print("❌ Файл результатов оценки не найден, запускаем оценку...")
+        # Если файл не существует, запустим комплексную оценку
+        try:
+            from train_rl import evaluate_agent_comprehensive
+            from stable_baselines3 import PPO
+            import pandas as pd
+
+            model = PPO.load('ppo_trading_agent.zip')
+            df = pd.read_csv('btc_usdt_data/full_btc_usdt_data_feature_engineered.csv')
+            df = df.tail(2000).reset_index(drop=True)  # Используем последние 2000 точек для оценки
+
+            results = evaluate_agent_comprehensive(model, 'btc_usdt_data/full_btc_usdt_data_feature_engineered.csv', n_episodes=5)
+
+            summary = results['summary']
+            avg_return = summary.get('avg_return', 0)
+            avg_sharpe = summary.get('avg_sharpe', 0)
+            avg_drawdown = summary.get('avg_drawdown', 0)
+
+            print(f"Средняя доходность: {avg_return*100:.2f}%")
+            print(f"Средний коэффициент Шарпа: {avg_sharpe:.4f}")
+            print(f"Средняя максимальная просадка: {avg_drawdown*100:.2f}%")
+
+            return avg_return, avg_sharpe, avg_drawdown
+        except Exception as e:
+            print(f"❌ Ошибка при запуске оценки: {e}")
             return 0, 0, 0
 
 def optimize_hyperparameters(n_trials=30):

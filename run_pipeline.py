@@ -93,42 +93,82 @@ def run_pipeline(data_days, timesteps, max_iterations, min_return, min_sharpe, m
     """Запуск пайплайна обучения с потоковым выводом"""
     print("🚀 Запуск RL Trading Pipeline...")
 
-    cmd = [
-        sys.executable, "rl_pipeline.py",
-        "--data-days", str(data_days),
-        "--timesteps", str(timesteps),
-        "--max-iterations", str(max_iterations),
-        "--min-return", str(min_return),
-        "--min-sharpe", str(min_sharpe),
-        "--max-drawdown", str(max_drawdown)
-    ]
-
     try:
-        # Use Popen for real-time output streaming
-        process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-            universal_newlines=True
-        )
+        # Start TensorBoard in background
+        import subprocess
+        import webbrowser
+        import time
+        import os
 
-        # Stream output in real-time
-        while True:
-            output = process.stdout.readline()
-            if output == '' and process.poll() is not None:
-                break
-            if output:
-                print(output.strip())
+        # Check if tensorboard is installed
+        try:
+            import tensorboard
+            print("📊 Запуск TensorBoard...")
+            tensorboard_process = subprocess.Popen(
+                ["tensorboard", "--logdir", "./rl_tensorboard/", "--port", "6006"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
+            time.sleep(3)  # Give TensorBoard time to start
 
-        return_code = process.poll()
+            # Open browser
+            print("🌐 Открытие TensorBoard в браузере...")
+            webbrowser.open("http://localhost:6006/")
+            print("📈 TensorBoard доступен по адресу: http://localhost:6006/")
+        except ImportError:
+            print("⚠️ TensorBoard не установлен, пропускаем запуск")
+            tensorboard_process = None
 
-        if return_code == 0:
+        # Import and run pipeline directly instead of subprocess
+        # This ensures proper output streaming
+        print("🔧 Импорт и запуск пайплайна...")
+        from rl_pipeline import main as pipeline_main
+        import sys
+
+        # Save original sys.argv
+        original_argv = sys.argv[:]
+
+        # Set new arguments for rl_pipeline.py
+        sys.argv = [
+            "rl_pipeline.py",
+            "--data-days", str(data_days),
+            "--timesteps", str(timesteps),
+            "--max-iterations", str(max_iterations),
+            "--min-return", str(min_return),
+            "--min-sharpe", str(min_sharpe),
+            "--max-drawdown", str(max_drawdown)
+        ]
+
+        try:
+            # Run the pipeline
+            pipeline_main()
+            success = True
+        except SystemExit as e:
+            success = e.code == 0
+        except Exception as e:
+            print(f"❌ Ошибка выполнения пайплайна: {e}")
+            success = False
+
+        # Restore original sys.argv
+        sys.argv = original_argv
+
+        # Clean up TensorBoard process
+        if tensorboard_process:
+            print("\n🔴 Завершение TensorBoard...")
+            tensorboard_process.terminate()
+            try:
+                tensorboard_process.wait(timeout=5)
+                print("✅ TensorBoard успешно завершен")
+            except subprocess.TimeoutExpired:
+                print("⚠️ TensorBoard не завершился, принудительное завершение...")
+                tensorboard_process.kill()
+                tensorboard_process.wait()
+
+        if success:
             print("✅ Пайплайн успешно завершен!")
             return True
         else:
-            print(f"❌ Пайплайн завершился с ошибкой (код {return_code})")
+            print("❌ Пайплайн завершился с ошибкой")
             return False
     except Exception as e:
         print(f"❌ Ошибка при запуске пайплайна: {e}")

@@ -169,14 +169,15 @@ def _correct_action(action, env_position, env):
     if action == 4 and env_position >= 0:
         return 0  # Hold
     
-    # If trying to buy long when already have a large position, hold
+    # If trying to buy long when already have a large position, hold instead
     if action == 1 and env_position > 0.01:  # Arbitrary limit
         return 0  # Hold
     
-    # If trying to sell short when already have a large short position, hold
+    # If trying to sell short when already have a large short position, hold instead
     if action == 3 and env_position < -0.01:  # Arbitrary limit
         return 0  # Hold
     
+    # Allow actions that are valid for the current position
     return action
 
 def _run_single_episode(env, model, initial_balance, df, episode_number=1, verbose=True):

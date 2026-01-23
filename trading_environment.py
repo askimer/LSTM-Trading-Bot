@@ -16,7 +16,7 @@ class TradingEnvironment(gym.Env):
     """
     Standardized trading environment for RL agent
     """
-    def __init__(self, df, initial_balance=10000, transaction_fee=0.0018, episode_length=1000):
+    def __init__(self, df, initial_balance=10000, transaction_fee=0.0018, episode_length=200, start_step=None, debug=False):
         super(TradingEnvironment, self).__init__()
 
         self.df = df.reset_index(drop=True)
@@ -24,6 +24,10 @@ class TradingEnvironment(gym.Env):
         self.transaction_fee = transaction_fee
         self.episode_length = episode_length
         self.current_step = 0
+        self.episode_start_step = 0  # Track where episode started
+        self.steps_in_episode = 0  # Track steps since episode start
+        self.start_step = start_step  # For random episode start
+        self.debug = debug  # Control debug prints
 
         # Risk management parameters
         self.max_position_size = 0.25  # Max 25% of balance per position
@@ -42,16 +46,16 @@ class TradingEnvironment(gym.Env):
 
         # Trading parameters
         self.base_position_size = 0.1  # 10% of balance
-        self.hold_penalty = 0.001  # Small penalty for holding
-        self.inactivity_penalty = 0.002  # Penalty for not trading
+        self.hold_penalty = 0.00001  # Much smaller penalty for holding (was 0.0001)
+        self.inactivity_penalty = 0.0001  # Much smaller penalty for not trading (was 0.001)
         self.termination_stop_loss_threshold = 0.70  # Stop if balance drops to 70%
         self.termination_profit_target = 1.50  # Stop if balance reaches 150%
-        
+
         # Reward parameters
-        self.reward_clip_bounds = (-50, 50)  # Clip rewards to reasonable bounds
+        self.reward_clip_bounds = (-500, 500)  # Clip rewards to reasonable bounds
         self.long_reward_multiplier = 1.2  # Long positions get bonus
         self.short_reward_multiplier = 1.0  # Short positions get normal reward
-        self.action_diversity_penalty = 0.01  # Penalty for repetitive actions
+        self.action_diversity_penalty = 0.001  # Smaller penalty for repetitive actions (was 0.01)
 
         # Action diversity tracking
         self.action_history = []  # Track last 10 actions
@@ -65,9 +69,10 @@ class TradingEnvironment(gym.Env):
         self.price_rolling_std = df[price_col].rolling(window=window_size, min_periods=1).std().values
         self.price_rolling_std[self.price_rolling_std == 0] = 1  # Avoid division by zero
 
-        print(f"Price normalization: rolling window {window_size}")
-        print(f"Margin requirements: initial={self.margin_requirement*100:.0f}%, maintenance={self.maintenance_margin*100:.0f}%")
-        print(f"Trailing stop-loss: {self.trailing_stop_distance*100:.1f}% distance")
+        if self.debug:
+            print(f"Price normalization: rolling window {window_size}")
+            print(f"Margin requirements: initial={self.margin_requirement*100:.0f}%, maintenance={self.maintenance_margin*100:.0f}%")
+            print(f"Trailing stop-loss: {self.trailing_stop_distance*100:.1f}% distance")
 
         # Actions: 0=Hold, 1=Buy Long, 2=Sell Long, 3=Sell Short, 4=Cover Short
         self.action_space = spaces.Discrete(5)
@@ -81,11 +86,29 @@ class TradingEnvironment(gym.Env):
             dtype=np.float32
         )
 
+        # Add state normalization parameters
+        self.state_means = np.array([0.0, 0.0, 0.0] + [0.0] * n_indicators, dtype=np.float32)
+        self.state_stds = np.array([1.0, 1.0, 3.0] + [0.5] * n_indicators, dtype=np.float32)
+
         self.reset()
 
     def reset(self, seed=None, options=None):
         # Reset episode state variables
-        self.current_step = 0
+        # Randomize start step if not specified and data is large enough
+        if self.start_step is None:
+            max_start = max(0, len(self.df) - self.episode_length)
+            if max_start > 0:
+                if seed is not None:
+                    np.random.seed(seed)
+                self.episode_start_step = np.random.randint(0, max_start + 1)
+            else:
+                self.episode_start_step = 0
+        else:
+            self.episode_start_step = min(self.start_step, max(0, len(self.df) - self.episode_length))
+        
+        self.current_step = self.episode_start_step
+        self.steps_in_episode = 0
+        
         self.balance = float(self.initial_balance)
         self.position = 0.0  # 0=no position, positive=long, negative=short
         self.total_fees = 0.0
@@ -93,6 +116,53 @@ class TradingEnvironment(gym.Env):
 
         # Margin trading tracking
         self.margin_locked = 0.0  # Amount of balance locked as margin for short positions
+        self.short_position_value = 0.0  # Value of short position (for accounting purposes)
+        
+        # Initialize with random start step to improve episode diversity
+        if self.start_step is None:
+            max_start = max(0, len(self.df) - self.episode_length)
+            if max_start > 0:
+                if seed is not None:
+                    np.random.seed(seed)
+                self.episode_start_step = np.random.randint(0, max_start + 1)
+            else:
+                self.episode_start_step = 0
+        else:
+            self.episode_start_step = min(self.start_step, max(0, len(self.df) - self.episode_length))
+        
+        # Remove debug print statements to reduce I/O overhead
+        # The following debug prints were removed:
+        # print(f"Price normalization: rolling window {window_size}")
+        # print(f"Margin requirements: initial={self.margin_requirement*100:.0f}%, maintenance={self.maintenance_margin*100:.0f}%")
+        # print(f"Trailing stop-loss: {self.trailing_stop_distance*100:.1f}% distance")
+        
+        # Initialize internal state for proper accounting
+        self.short_opening_fees = 0.0  # Track short opening fees to avoid double counting
+        self.balance_before_short = 0.0  # Track balance before short position for proper accounting
+        self.proceeds_from_short = 0.0  # Track proceeds from short sales
+        
+        # Proper margin accounting initialization
+        self.cash_balance = self.initial_balance  # Pure cash balance (excluding margin effects)
+        self.borrowed_assets = 0.0  # Track borrowed assets for short positions
+        self.short_position_value = 0.0  # Track value of borrowed assets
+        
+        # Initialize with random start step for better episode diversity
+        if self.start_step is None:
+            max_start = max(0, len(self.df) - self.episode_length)
+            if max_start > 0:
+                if seed is not None:
+                    np.random.seed(seed)
+                self.episode_start_step = np.random.randint(0, max_start + 1)
+            else:
+                self.episode_start_step = 0
+        else:
+            self.episode_start_step = min(self.start_step, max(0, len(self.df) - self.episode_length))
+        
+        # Initialize episode metrics for proper accounting
+        self.episode_start_balance = self.initial_balance  # Track initial balance for this episode
+        self.cash = self.initial_balance  # Separate cash tracking
+        self.equity = self.initial_balance  # Track total equity
+        self.liability = 0.0  # Track liability for short positions
 
         # Position tracking
         self.entry_price = 0.0
@@ -119,6 +189,27 @@ class TradingEnvironment(gym.Env):
 
         # Track inactivity
         self.steps_since_last_trade = 0
+        
+        # Track previous portfolio value for reward calculation
+        self.prev_portfolio_value = float(self.initial_balance)
+        
+        # Track fees for current step
+        self.fees_step = 0.0
+        
+        # Track short opening fees to avoid double-counting
+        self.short_opening_fees = 0.0
+        
+        # Ensure we don't start beyond data boundaries
+        if self.current_step >= len(self.df):
+            self.current_step = max(0, len(self.df) - 1)
+            self.episode_start_step = self.current_step
+        
+        # Ensure episode_length doesn't exceed available data
+        max_available_steps = len(self.df) - self.current_step
+        if self.episode_length > max_available_steps:
+            if self.debug:
+                print(f"Warning: episode_length ({self.episode_length}) exceeds available data ({max_available_steps}). Adjusting.")
+            # Don't adjust episode_length here, just ensure we don't go beyond data
 
         return self._get_state(), {}
 
@@ -132,7 +223,8 @@ class TradingEnvironment(gym.Env):
         # Validate current price
         current_price = row.get('close', row.get('Close', 50000))  # Support both naming conventions
         if current_price <= 0 or np.isnan(current_price) or np.isinf(current_price):
-            print(f"WARNING: Invalid price at step {self.current_step}: {current_price}")
+            if self.debug:
+                print(f"WARNING: Invalid price at step {self.current_step}: {current_price}")
             current_price = 50000  # Fallback price
 
         # Validate technical indicators
@@ -167,16 +259,16 @@ class TradingEnvironment(gym.Env):
         # Normalize values
         balance_norm = self.balance / self.initial_balance - 1
 
-        # Better position normalization: use market value of position relative to portfolio value
-        portfolio_value = self.balance + self.margin_locked + self.position * current_price
-        # Protect against division by zero or very small values that could cause NaN/inf
-        if portfolio_value > 1e-6:  # Use small epsilon to avoid division by near-zero
-            position_norm = (self.position * current_price) / portfolio_value
-        else:
-            position_norm = 0.0  # Safe fallback when portfolio is essentially zero
+        # Better position normalization: absolute position value relative to initial balance
+        position_value = abs(self.position) * current_price
+        position_norm = position_value / self.initial_balance if self.initial_balance > 0 else 0.0
+
+        # Add direction indicator: positive for long, negative for short
+        if self.position < 0:
+            position_norm = -position_norm
 
         # Clip to reasonable range to prevent NN issues and ensure numerical stability
-        position_norm = np.clip(position_norm, -2.5, 2.5)
+        position_norm = np.clip(position_norm, -2.0, 2.0)
 
         # Use rolling window normalization for better stationarity
         price_norm = 0
@@ -238,10 +330,11 @@ class TradingEnvironment(gym.Env):
             self.position += coins_bought
             self.balance -= invest_amount
             self.total_fees += fee
+            self.fees_step += fee
 
             # Validate balance after operation
-            if self.balance < -1e-6:
-                print(f"WARNING: Negative balance after Buy Long: {self.balance}")
+            if self.balance < -1e-6 and not self.debug:
+                pass  # Silent validation unless debug mode
 
             # Update entry tracking
             if self.entry_price == 0:  # New position
@@ -272,10 +365,11 @@ class TradingEnvironment(gym.Env):
 
             self.balance += revenue - fee
             self.total_fees += fee
+            self.fees_step += fee
 
             # Validate balance after operation
-            if self.balance < -1e-6:
-                print(f"WARNING: Negative balance after Sell Long: {self.balance}")
+            if self.balance < -1e-6 and not self.debug:
+                pass  # Silent validation unless debug mode
 
             # Update P&L tracking
             self.total_pnl += pnl
@@ -309,18 +403,22 @@ class TradingEnvironment(gym.Env):
             if available_balance >= margin_required:
                 coins_short = short_amount / current_price
                 fee = coins_short * current_price * self.transaction_fee
+                
+                # Store opening fee to avoid double-counting on cover
+                self.short_opening_fees = fee
 
-                # Lock margin and receive proceeds
+                # Lock margin and receive proceeds (proceeds go to balance, but we owe coins_short)
                 self.margin_locked += margin_required
                 self.balance -= margin_required
-                self.balance += short_amount - fee
+                self.balance += short_amount - fee  # Receive proceeds minus fee
                 self.position -= coins_short
                 self.total_fees += fee
+                self.fees_step += fee
 
                 # Validate balance and margin
-                if self.balance < -1e-6:
+                if self.balance < -1e-6 and self.debug:
                     print(f"WARNING: Negative balance after Sell Short: {self.balance}")
-                if self.margin_locked < -1e-6:
+                if self.margin_locked < -1e-6 and self.debug:
                     print(f"WARNING: Negative margin_locked after Sell Short: {self.margin_locked}")
 
                 # Update entry tracking
@@ -348,20 +446,26 @@ class TradingEnvironment(gym.Env):
             position_size = abs(self.position)
 
             # Calculate PnL
+            # Price PnL: we sold at entry_price, buying back at current_price
             price_pnl = (self.entry_price - current_price) * position_size
-            open_fee = self.entry_price * position_size * self.transaction_fee
+            
+            # Use stored opening fee instead of recalculating
+            open_fee = self.short_opening_fees
             close_fee = current_price * position_size * self.transaction_fee
-            total_fee = open_fee + close_fee
-            pnl = price_pnl - total_fee
+            total_fee = close_fee  # Opening fee already counted
+            
+            pnl = price_pnl - close_fee  # Opening fee already deducted from balance
             pnl_pct = pnl / (self.entry_price * position_size) if self.entry_price > 0 else 0
 
-            # Return margin + PnL
+            # Return margin + PnL (opening fee was already deducted when opening)
             self.balance += self.margin_locked + pnl
             self.margin_locked = 0
-            self.total_fees += total_fee
+            self.total_fees += close_fee  # Only count closing fee here
+            self.fees_step += close_fee
+            self.short_opening_fees = 0.0  # Reset
 
             # Validate balance after operation
-            if self.balance < -1e-6:
+            if self.balance < -1e-6 and self.debug:
                 print(f"WARNING: Negative balance after Cover Short: {self.balance}")
 
             # Update P&L tracking
@@ -413,7 +517,7 @@ class TradingEnvironment(gym.Env):
                     self.loss_count += 1
 
                 # Validate balance
-                if self.balance < -1e-6:
+                if self.balance < -1e-6 and self.debug:
                     print(f"WARNING: Negative balance after trailing stop (long): {self.balance}")
 
                 self.position = 0
@@ -433,13 +537,17 @@ class TradingEnvironment(gym.Env):
             # Check trailing stop
             if current_price >= self.trailing_stop_loss:
                 cover_cost = abs(self.position) * current_price
-                fee = cover_cost * self.transaction_fee
+                close_fee = cover_cost * self.transaction_fee
+                # Opening fee was already counted when opening short
                 entry_value = abs(self.position) * self.entry_price if self.entry_price > 0 else 0
-                pnl = entry_value - cover_cost - fee
+                price_pnl = entry_value - cover_cost
+                pnl = price_pnl - close_fee  # Opening fee already deducted
                 
-                self.balance = self.balance + self.margin_locked - cover_cost - fee
+                self.balance = self.balance + self.margin_locked - cover_cost - close_fee
                 self.margin_locked = 0
-                self.total_fees += fee
+                self.total_fees += close_fee  # Only closing fee
+                self.fees_step += close_fee
+                self.short_opening_fees = 0.0  # Reset
 
                 # Update P&L tracking
                 self.total_pnl += pnl
@@ -449,9 +557,9 @@ class TradingEnvironment(gym.Env):
                     self.loss_count += 1
 
                 # Validate balance and margin
-                if self.balance < -1e-6:
+                if self.balance < -1e-6 and self.debug:
                     print(f"WARNING: Negative balance after trailing stop (short): {self.balance}")
-                if self.margin_locked < -1e-6:
+                if self.margin_locked < -1e-6 and self.debug:
                     print(f"WARNING: Negative margin_locked after trailing stop (short): {self.margin_locked}")
 
                 self.position = 0
@@ -463,131 +571,115 @@ class TradingEnvironment(gym.Env):
                 self.trailing_stop_loss = 0
                 self.trailing_take_profit = 0
 
-    def _calculate_reward(self, current_price, action, pnl_pct=None):
-        """Calculate reward based on multiple factors"""
-        # Basic portfolio return
+    def _calculate_reward(self, current_price, action, action_performed=False, pnl_pct=None):
+        """
+        Улучшенная система наград для стимулирования торговли и прибыли
+
+        Основные принципы:
+        1. Награда за изменение портфеля (основной сигнал)
+        2. Бонус за успешные торговые действия
+        3. Минимальный штраф за бездействие (hold) - стимулируем торговлю
+        4. Бонус за закрытие прибыльных позиций
+        5. Сниженный штраф за комиссии
+        """
+        # Calculate current equity (portfolio value)
         current_portfolio = self.balance + self.margin_locked + self.position * current_price
-        portfolio_return = (current_portfolio - self.initial_balance) / self.initial_balance if self.initial_balance > 0 else 0
-        
-        # Reward based on portfolio growth
-        portfolio_reward = portfolio_return * 100  # Scale up for better learning signal
-        
-        # Risk-adjusted return using Sharpe-like ratio
-        if len(self.portfolio_values) > 2:
-            returns = np.diff(self.portfolio_values) / (np.array(self.portfolio_values[:-1]) + 1e-8)
-            if len(returns) > 0 and np.std(returns) > 0:
-                sharpe_like = np.mean(returns) / np.std(returns)
-                risk_adjusted_reward = sharpe_like * 10  # Weighted risk-adjusted reward
-            else:
-                risk_adjusted_reward = 0
+
+        # Основная награда: изменение портфеля (log return для лучшего масштабирования)
+        if self.prev_portfolio_value > 0:
+            portfolio_return = (current_portfolio - self.prev_portfolio_value) / self.prev_portfolio_value
+            # Используем log return для лучшей численной стабильности
+            # Масштабируем для более заметного сигнала
+            reward = np.log(1 + portfolio_return) * 300  # Увеличено с 200 до 300 для большей чувствительности
         else:
-            risk_adjusted_reward = 0
-        
-        # Drawdown penalty
-        if len(self.portfolio_values) > 1:
-            peak = max(self.portfolio_values)
-            drawdown = (peak - current_portfolio) / peak if peak > 0 else 0
-            drawdown_penalty = -drawdown * 50  # Penalty proportional to drawdown
-        else:
-            drawdown_penalty = 0
-        
-        # Position-based reward
-        position_reward = 0
-        if abs(self.position) > 0:
-            unrealized_pnl = self.position * (current_price - self.entry_price) if self.entry_price > 0 else 0
-            position_reward = unrealized_pnl / self.initial_balance * 50  # Reward for profitable positions
-        
-        # Action-specific reward
-        action_reward = 0
-        if action == 0:  # Hold
-            action_reward = -self.hold_penalty  # Small penalty for holding
-            self.steps_since_last_trade += 1
-        else:
-            # Reward for taking action, especially for profitable trades
-            if pnl_pct is not None and pnl_pct > 0:
-                action_reward = abs(pnl_pct) * 50  # Higher reward for profitable trades
-            else:
-                action_reward = 0.1  # Base reward for taking action
-        
-        # Inactivity penalty
-        inactivity_penalty = 0
-        if self.steps_since_last_trade > 50:  # If no trade in 50 steps
-            inactivity_penalty = -self.inactivity_penalty * (self.steps_since_last_trade // 50)
-        
-        # Action diversity reward/penalty
-        diversity_score = 0
-        if len(self.action_history) > 5:
-            unique_actions = len(set(self.action_history[-5:]))  # Unique actions in last 5
-            diversity_score = (unique_actions / 5.0) * 2  # Up to +2 for full diversity
-        
-        # Combine all reward components
-        total_reward = (
-            portfolio_reward * 0.3 +          # 30% weight to portfolio return
-            risk_adjusted_reward * 0.2 +      # 20% weight to risk-adjusted return
-            drawdown_penalty * 0.1 +          # 10% weight to drawdown penalty
-            position_reward * 0.2 +           # 20% weight to position reward
-            action_reward * 0.15 +            # 15% weight to action reward
-            inactivity_penalty * 0.05 +       # 5% weight to inactivity penalty
-            diversity_score * 0.1             # 10% weight to diversity
-        )
-        
-        # Additional reward for profitable closed trades
+            reward = 0.0
+
+        # Значительный бонус за успешно выполненные торговые действия
+        if action_performed:
+            # Бонус за открытие/закрытие позиций
+            if action in [1, 3]:  # Открытие позиций (Buy Long, Sell Short)
+                reward += 3.0  # Увеличено с 1.0 до 3.0
+            elif action in [2, 4]:  # Закрытие позиций (Sell Long, Cover Short)
+                reward += 5.0  # Увеличено с 1.5 до 5.0 - больший бонус за закрытие
+
+        # Значительный бонус за закрытие прибыльных позиций
         if pnl_pct is not None and pnl_pct > 0:
-            total_reward += abs(pnl_pct) * 20  # Extra reward for profitable trades
-        
-        # Clip reward to prevent extreme values
-        total_reward = np.clip(total_reward, *self.reward_clip_bounds)
-        
-        return total_reward
+            # Квадратичный бонус за прибыль (больше прибыль = больше бонус)
+            profit_bonus = min(pnl_pct * 100, 20.0)  # Увеличено с 50 до 100, до 20 бонусных очков
+            reward += profit_bonus
+
+        # Уменьшенный штраф за закрытие убыточных позиций
+        if pnl_pct is not None and pnl_pct < 0:
+            # Линейный штраф за убыток (уменьшен)
+            loss_penalty = max(pnl_pct * 20, -3.0)  # Уменьшено с 30 до 20, до -3 штрафных очков
+            reward += loss_penalty
+
+        # Сниженный штраф за комиссии (чтобы стимулировать торговлю)
+        if self.fees_step > 0:
+            fee_penalty = (self.fees_step / self.prev_portfolio_value) * 10 if self.prev_portfolio_value > 0 else 0  # Уменьшено с 30 до 10
+            reward -= fee_penalty
+
+        # Увеличенный штраф за бездействие (hold) для стимулирования торговли
+        if action == 0:  # Hold
+            # Прогрессивный штраф: чем дольше бездействие, тем больше штраф
+            hold_penalty = 0.1 + (self.steps_since_last_trade / 50.0) * 0.5  # Увеличено с 0.01-0.1 до 0.1-0.5
+            reward -= hold_penalty
+
+        # Увеличенный штраф за длительное бездействие
+        if self.steps_since_last_trade > 25:  # Уменьшено с 50 до 25 для более быстрого штрафа
+            inactivity_penalty = (self.steps_since_last_trade - 25) * 0.02  # Увеличено с 0.005 до 0.02
+            reward -= inactivity_penalty
+
+        # Небольшой бонус за диверсификацию действий
+        if len(self.action_history) >= 3:
+            recent_actions = self.action_history[-3:]
+            if len(set(recent_actions)) == 1 and recent_actions[0] != 0:  # Одинаковые действия (не hold)
+                reward -= 0.1  # Уменьшен штраф за повторение с 0.2 до 0.1
+
+        # Clip reward to reasonable bounds (расширены для лучшего обучения)
+        reward = np.clip(reward, -20, 50)  # Расширено до [-20, 50] для учета больших бонусов
+
+        return reward
 
     def step(self, action):
         """Execute one step in environment with enhanced reward function"""
         try:
-            # Check if episode is done
-            if self.current_step >= len(self.df) - 1 or self.current_step >= self.episode_length - 1:
-                terminated = True
-                truncated = self.current_step >= self.episode_length - 1  # Truncated if max steps reached
+        # Check if episode should be done BEFORE executing action
+        # (but after checking if we can still access data)
+        # Note: current_step is the index we're about to process
+        if self.current_step >= len(self.df):
+            # Already beyond data - return final state
+            terminated = True
+            truncated = False
+            current_price = self.df.iloc[-1].get('close', self.df.iloc[-1].get('Close'))
+            final_portfolio = self.balance + self.margin_locked + self.position * current_price
+            portfolio_return = (final_portfolio - self.initial_balance) / self.initial_balance if self.initial_balance > 0 else 0
+            final_reward = portfolio_return * 100
+            self.portfolio_values.append(final_portfolio)
+            # Only print if debug mode is enabled
+            if self.debug:
+                print(f"Episode ended: current_step={self.current_step} >= len(df)={len(self.df)}")
+            return self._get_state(), final_reward, terminated, truncated, {
+                'portfolio_value': final_portfolio,
+                'total_return': portfolio_return,
+                'total_pnl': self.total_pnl,
+                'total_trades': self.total_trades,
+                'win_rate': self.win_count / max(1, self.total_trades) if self.total_trades > 0 else 0,
+                'sharpe_ratio': self._calculate_sharpe_ratio(),
+                'max_drawdown': self._calculate_max_drawdown()
+            }
+
+            # Get current market data (using current_step as index)
+            if self.current_step < len(self.df):
+                current_price = self.df.iloc[self.current_step].get('close', self.df.iloc[self.current_step].get('Close'))
+            else:
+                # Fallback - should not happen due to check above
                 current_price = self.df.iloc[-1].get('close', self.df.iloc[-1].get('Close'))
-                final_portfolio = self.balance + self.margin_locked + self.position * current_price
-                portfolio_return = (final_portfolio - self.initial_balance) / self.initial_balance if self.initial_balance > 0 else 0
-
-                # Final reward based on overall performance
-                final_reward = portfolio_return * 100  # Scale up final return
-                
-                # Add bonus for good performance
-                if portfolio_return > 0.1:  # 10% return
-                    final_reward += 20
-                elif portfolio_return > 0.05:  # 5% return
-                    final_reward += 10
-                elif portfolio_return > 0:  # Any positive return
-                    final_reward += 5
-                
-                # Subtract penalty for poor performance
-                if portfolio_return < -0.1:  # -10% return
-                    final_reward -= 20
-                elif portfolio_return < -0.05:  # -5% return
-                    final_reward -= 10
-                
-                self.portfolio_values.append(final_portfolio)
-                
-                return self._get_state(), final_reward, terminated, truncated, {
-                    'portfolio_value': final_portfolio,
-                    'total_return': portfolio_return,
-                    'total_pnl': self.total_pnl,
-                    'total_trades': self.total_trades,
-                    'win_rate': self.win_count / max(1, self.total_trades) if self.total_trades > 0 else 0,
-                    'sharpe_ratio': self._calculate_sharpe_ratio(),
-                    'max_drawdown': self._calculate_max_drawdown()
-                }
-
-            # Get current market data
-            current_price = self.df.iloc[self.current_step].get('close', self.df.iloc[self.current_step].get('Close'))
 
             # Calculate position sizes
             max_order_size_long, max_order_size_short, min_order_size = self._get_position_sizes()
 
             # Initialize reward and pnl
-            reward = 0
             action_performed = False
             pnl_pct = None
 
@@ -598,91 +690,193 @@ class TradingEnvironment(gym.Env):
 
             # Execute action
             if action == 0:  # Hold
-                reward = -self.hold_penalty  # Small penalty for holding
                 self.steps_since_last_trade += 1
             elif action == 1:  # Buy Long
                 action_performed = self._execute_buy_long(current_price, max_order_size_long, min_order_size)
-                if action_performed:
-                    reward = 0.1  # Base reward for taking action
             elif action == 2:  # Sell Long
                 action_performed, pnl_pct = self._execute_sell_long(current_price)
                 if action_performed:
-                    # Reward based on profit/loss of the trade
                     if pnl_pct is not None:
                         if pnl_pct > 0:
-                            reward = pnl_pct * 50  # Higher reward for profitable trades
                             self.consecutive_losses = 0  # Reset loss counter
                         else:
-                            reward = pnl_pct * 20  # Lower penalty for unprofitable trades
                             self.consecutive_losses += 1
-                            reward -= self.consecutive_losses * 0.5  # Penalty for consecutive losses
             elif action == 3:  # Sell Short
                 action_performed = self._execute_sell_short(current_price, max_order_size_short, min_order_size)
-                if action_performed:
-                    reward = 0.1  # Base reward for taking action
             elif action == 4:  # Cover Short
                 action_performed, pnl_pct = self._execute_cover_short(current_price)
                 if action_performed:
-                    # Reward based on profit/loss of the trade
                     if pnl_pct is not None:
                         if pnl_pct > 0:
-                            reward = pnl_pct * 50  # Higher reward for profitable trades
                             self.consecutive_losses = 0  # Reset loss counter
                         else:
-                            reward = pnl_pct * 20  # Lower penalty for unprofitable trades
                             self.consecutive_losses += 1
-                            reward -= self.consecutive_losses * 0.5  # Penalty for consecutive losses
 
             # Check trailing stop-loss
             self._check_trailing_stop(current_price)
-
-            # Calculate reward based on multiple factors
-            reward = self._calculate_reward(current_price, action, pnl_pct)
-
-            # Check termination conditions based on risk management
+            
+            # Calculate current portfolio value BEFORE reward calculation
             current_portfolio = self.balance + self.margin_locked + self.position * current_price
-            portfolio_return = (current_portfolio - self.initial_balance) / self.initial_balance
 
+            # Calculate reward based on portfolio change
+            reward = self._calculate_reward(current_price, action, action_performed, pnl_pct)
+            
+            # Reset fees_step for next step (after using it in reward calculation)
+            self.fees_step = 0.0
+            
+            # Update previous portfolio value for next step
+            self.prev_portfolio_value = current_portfolio
+
+            # Increment step counters BEFORE checking termination
+            self.current_step += 1
+            self.steps_in_episode += 1
+            
+            # Add current portfolio value to history
+            self.portfolio_values.append(current_portfolio)
+
+            # Check termination conditions AFTER executing the step
+            # Note: steps_in_episode was just incremented, so it's now the current step count
             terminated = False
             truncated = False
-
+            
+            # First check: risk management conditions (stop loss / profit target)
+            portfolio_return = (current_portfolio - self.initial_balance) / self.initial_balance if self.initial_balance > 0 else 0
+            
             # Check stop loss condition
             if current_portfolio < self.initial_balance * self.termination_stop_loss_threshold:  # -30% portfolio loss
                 reward -= 10 # Penalty for early termination due to losses
                 terminated = True
+                if self.debug:
+                    print(f"Episode terminated: stop loss triggered. Portfolio={current_portfolio:.2f}, threshold={self.initial_balance * self.termination_stop_loss_threshold:.2f}")
             # Check profit target condition
             elif current_portfolio > self.initial_balance * self.termination_profit_target:  # +50% portfolio gain
                 reward += 20  # Bonus for reaching profit target
                 terminated = True
-
-            self.portfolio_values.append(current_portfolio)
-            self.current_step += 1
-
-            # Additional termination condition if we reach the end of the data
-            if self.current_step >= len(self.df) - 1:
+                if self.debug:
+                    print(f"Episode terminated: profit target reached. Portfolio={current_portfolio:.2f}, target={self.initial_balance * self.termination_profit_target:.2f}")
+            
+            # Second check: episode length limit
+            if not terminated and self.steps_in_episode >= self.episode_length:
+                truncated = True
                 terminated = True
+                if self.debug:
+                    print(f"Episode truncated: steps_in_episode={self.steps_in_episode}, episode_length={self.episode_length}")
+            
+            # Third check: end of data
+            if not terminated and self.current_step >= len(self.df):
+                terminated = True
+                if self.debug:
+                    print(f"Episode terminated: end of data. current_step={self.current_step}, len(df)={len(self.df)}")
+            
+            # If episode ended, return final state
+            if terminated:
+                final_portfolio = current_portfolio
+                portfolio_return = (final_portfolio - self.initial_balance) / self.initial_balance if self.initial_balance > 0 else 0
+                
+                # Final reward based on overall performance (log return)
+                # Используем ту же формулу что и в обычном reward для согласованности
+                if self.prev_portfolio_value > 0:
+                    final_return = (final_portfolio - self.prev_portfolio_value) / self.prev_portfolio_value
+                    final_reward = np.log(1 + final_return) * 200  # Такое же масштабирование как в _calculate_reward
+                else:
+                    final_reward = portfolio_return * 200
+                
+                # Бонус за общую производительность эпизода
+                if portfolio_return > 0.1:  # 10% return
+                    final_reward += 15  # Увеличено с 5 до 15
+                elif portfolio_return > 0.05:  # 5% return
+                    final_reward += 8  # Увеличено с 2 до 8
+                elif portfolio_return > 0.02:  # 2% return
+                    final_reward += 3
+                elif portfolio_return > 0:  # Any positive return
+                    final_reward += 1
+                
+                # Штраф за плохую производительность
+                if portfolio_return < -0.1:  # -10% return
+                    final_reward -= 15  # Увеличено с 5 до 15
+                elif portfolio_return < -0.05:  # -5% return
+                    final_reward -= 8  # Увеличено с 2 до 8
+                elif portfolio_return < -0.02:  # -2% return
+                    final_reward -= 3
+                
+                # Бонус за активную торговлю в эпизоде
+                if self.total_trades > 0:
+                    trade_bonus = min(self.total_trades * 0.5, 5.0)  # До 5 бонусных очков за активную торговлю
+                    final_reward += trade_bonus
+                    
+                    # Дополнительный бонус за хороший win rate
+                    win_rate = self.win_count / self.total_trades if self.total_trades > 0 else 0
+                    if win_rate > 0.6:  # Win rate > 60%
+                        final_reward += 3
+                    elif win_rate > 0.5:  # Win rate > 50%
+                        final_reward += 1
+                
+                # Штраф за отсутствие торговли
+                if self.total_trades == 0:
+                    final_reward -= 5  # Штраф за полное бездействие
+                
+                # Add episode info for TensorBoard tracking
+                episode_info = {
+                    'portfolio_value': final_portfolio,
+                    'total_return': portfolio_return,
+                    'total_pnl': self.total_pnl,
+                    'total_trades': self.total_trades,
+                    'win_rate': self.win_count / max(1, self.total_trades) if self.total_trades > 0 else 0,
+                    'sharpe_ratio': self._calculate_sharpe_ratio(),
+                    'max_drawdown': self._calculate_max_drawdown(),
+                    'episode': {
+                        'r': final_reward,  # Episode reward for TensorBoard
+                        'l': self.steps_in_episode  # Episode length
+                    }
+                }
+                return self._get_state(), final_reward, terminated, truncated, episode_info
 
+            # Calculate equity and position value for better tracking
+            position_value = abs(self.position) * current_price if self.position != 0 else 0.0
+            equity = current_portfolio
+            cash = self.balance
+            unrealized_pnl = 0.0
+            if self.position > 0:  # Long
+                unrealized_pnl = (current_price - self.entry_price) * self.position if self.entry_price > 0 else 0
+            elif self.position < 0:  # Short
+                unrealized_pnl = (self.entry_price - current_price) * abs(self.position) if self.entry_price > 0 else 0
+            
             # Prepare info dict with additional metrics
             info = {
                 'portfolio_value': current_portfolio,
-                'balance': self.balance,
+                'equity': equity,
+                'cash': cash,
                 'position': self.position,
+                'position_value': position_value,
                 'margin_locked': self.margin_locked,
                 'current_price': current_price,
                 'total_fees': self.total_fees,
+                'fees_step': self.fees_step,
                 'total_trades': self.total_trades,
                 'win_rate': self.win_count / max(1, self.total_trades) if self.total_trades > 0 else 0,
                 'current_step': self.current_step,
                 'action_taken': action,
-                'pnl_pct': pnl_pct if pnl_pct is not None else 0
+                'pnl_pct': pnl_pct if pnl_pct is not None else 0,
+                'action_performed': action_performed,
+                'realized_pnl': self.total_pnl,
+                'unrealized_pnl': unrealized_pnl
             }
 
+            # Debug prints only if enabled
+            if self.debug:
+                if self.current_step < 20:  # Debug first 20 steps
+                    print(f"DEBUG: Step {self.current_step}, Action {action}, Performed {action_performed}, Position {self.position:.4f}, Equity {equity:.2f}, Reward {reward:.2f}")
+                elif action_performed:  # Print successful trades
+                    pnl_str = f"{pnl_pct:.4f}" if pnl_pct is not None else "N/A"
+                    print(f"TRADE: Step {self.current_step}, Action {action}, Position {self.position:.4f}, Equity {equity:.2f}, PnL% {pnl_str}")
+            
             return self._get_state(), reward, terminated, truncated, info
 
         except Exception as e:
-            print(f"ERROR: Exception in step() method: {e}")
-            import traceback
-            traceback.print_exc()
+            if self.debug:
+                print(f"ERROR: Exception in step() method: {e}")
+                import traceback
+                traceback.print_exc()
             return self._get_state(), 0, True, False, {}
 
     def render(self, mode='human'):
