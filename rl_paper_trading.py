@@ -245,7 +245,7 @@ def _run_single_episode(env, model, initial_balance, df, episode_number=1, verbo
             print(f"    Balance: ${env.balance:.2f}")
             print(f"    Price: ${current_price:.2f}")
             print(f"    Action: {action}")
-            print(f"    Portfolio: ${env.balance + env.margin_locked + env.position * current_price - abs(env.position) * current_price * 0.0018:.2f}")
+            print(f"    Portfolio: ${env.balance + env.margin_locked + env.position * current_price:.2f}")
 
         # Execute action in environment
         next_state, reward, terminated, truncated, _ = env.step(action)
@@ -254,9 +254,11 @@ def _run_single_episode(env, model, initial_balance, df, episode_number=1, verbo
         # Update state
         state = next_state
 
-        # Record portfolio state
+        # Record portfolio state - calculate correctly for margin trading
+        # Portfolio = Available Balance + Margin Locked + Position_Value
+        # Position value should account for short positions (negative for shorts)
         current_price = df.iloc[min(env.current_step, len(df)-1)].get('close', df.iloc[min(env.current_step, len(df)-1)].get('Close'))
-        portfolio_value = env.balance + env.margin_locked + env.position * current_price - abs(env.position) * current_price * 0.0018
+        portfolio_value = env.balance + env.margin_locked + env.position * current_price
         portfolio_history.append({
             'step': step_count,
             'price': current_price,

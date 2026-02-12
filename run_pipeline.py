@@ -23,6 +23,9 @@ def install_dependencies():
         else:
             print("✅ Основные зависимости установлены")
             return True
+    except FileNotFoundError:
+        print("❌ uv не найден. Установите uv сначала: pip install uv")
+        return False
     except Exception as e:
         print(f"❌ Ошибка при установке зависимостей: {e}")
         return False

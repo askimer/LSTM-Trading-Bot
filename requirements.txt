@@ -49,3 +49,4 @@ ta
 ccxt>=4.3.90
 python-dotenv>=1.0.1
 optuna>=3.6.1
+seaborn

@@ -104,3 +104,12 @@ rl_logs/
 api_keys.json
 keys.json
 credentials.ini
+.aider*
+.env
+.env
+*.tfevents.*
+.env
+.env
+.env
+.env
+node_modules

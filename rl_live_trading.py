@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!.venv/bin/ python3
 """
 RL Live Trading Module
 Performs virtual/paper trading on live market data using trained RL agent
@@ -96,6 +96,16 @@ class RLLiveTradingBot:
         self.long_entry_price = 0
         self.short_entry_price = 0
 
+        # Margin trading tracking (similar to trading_environment)
+        self.margin_locked = 0.0  # Amount of balance locked as margin for short positions
+        self.short_opening_fees = 0.0  # Track short opening fees to avoid double counting
+        self.proceeds_from_short = 0.0  # Track proceeds from short sales
+        self.margin_requirement = 0.3  # 30% initial margin requirement for shorts
+        self.maintenance_margin = 0.15  # 15% maintenance margin
+        self.cash_balance = initial_balance  # Pure cash balance (excluding margin effects)
+        self.borrowed_assets = 0.0  # Track borrowed assets for short positions
+        self.liability = 0.0  # Track liability for short positions
+
         # Trailing stop-loss and take-profit tracking
         self.trailing_stop_loss = 0
         self.trailing_take_profit = 0
@@ -113,6 +123,10 @@ class RLLiveTradingBot:
         # Technical indicators history
         self.indicators_history = []
 
+        # CSV logging for trade results
+        self.trade_log_file = 'trade_results.csv'
+        self.init_csv_logging()
+
         # Market data buffer (need enough data for indicators)
         self.market_data_buffer = []
 
@@ -124,6 +138,57 @@ class RLLiveTradingBot:
         logger.info(f"Test mode: {test_mode}")
         logger.info(f"Initial balance: {self.initial_balance} USDT")
 
+    def init_csv_logging(self):
+        """Initialize CSV logging for trade results"""
+        import csv
+        import os
+        
+        # Check if file exists, if not create with headers
+        if not os.path.exists(self.trade_log_file):
+            with open(self.trade_log_file, 'w', newline='', encoding='utf-8') as csvfile:
+                fieldnames = [
+                    'timestamp', 'type', 'price', 'amount', 'value', 'fee', 
+                    'pnl', 'cumulative_pnl', 'balance_after', 'position_after',
+                    'long_position', 'short_position', 'trigger_price'
+                ]
+                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                writer.writeheader()
+                logger.info(f"Created CSV log file: {self.trade_log_file}")
+
+    def log_trade_to_csv(self, trade_data):
+        """Log trade data to CSV file"""
+        import csv
+        
+        # Prepare row data, ensuring all required fields are present
+        row = {
+            'timestamp': trade_data.get('timestamp', ''),
+            'type': trade_data.get('type', ''),
+            'price': trade_data.get('price', 0),
+            'amount': trade_data.get('amount', 0),
+            'value': trade_data.get('value', 0),
+            'fee': trade_data.get('fee', 0),
+            'pnl': trade_data.get('pnl', 0),
+            'cumulative_pnl': trade_data.get('cumulative_pnl', 0),
+            'balance_after': trade_data.get('balance_after', 0),
+            'position_after': trade_data.get('position_after', 0),
+            'long_position': trade_data.get('long_position', 0),
+            'short_position': trade_data.get('short_position', 0),
+            'trigger_price': trade_data.get('trigger_price', 0)
+        }
+        
+        # Check if file exists and write header if it's a new file
+        file_exists = os.path.exists(self.trade_log_file)
+        with open(self.trade_log_file, 'a', newline='', encoding='utf-8') as csvfile:
+            fieldnames = [
+                'timestamp', 'type', 'price', 'amount', 'value', 'fee', 
+                'pnl', 'cumulative_pnl', 'balance_after', 'position_after',
+                'long_position', 'short_position', 'trigger_price'
+            ]
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            if not file_exists:
+                writer.writeheader()
+            writer.writerow(row)
+
     def calculate_fee(self, amount, fee_rate=0.0005):
         """Расчет комиссий для фьючерсов BingX (тейкер: 0.05%, мейкер: 0.02%)"""
         # Для бессрочных фьючерсов: 0.02% (мейкер) / 0.05% (тейкер)
@@ -131,76 +196,80 @@ class RLLiveTradingBot:
         # По умолчанию используем ставку тейкера (0.05%), так как бот использует рыночные ордера
         return amount * fee_rate
 
-    def get_market_data(self):
-        """Get current market data from BingX using CCXT"""
+    def _fetch_from_binance(self, symbol_ccxt, timeframe='1m', limit=350):
+        """Fallback: Get data from Binance public API"""
         try:
-            # Get recent klines (1m interval, need at least 300 for indicators)
-            symbol_ccxt = self.symbol.replace('-', '/')
-            klines = self.exchange.fetch_ohlcv(symbol_ccxt, timeframe='1m', limit=350)
-
-            if not klines:
-                logger.warning("No kline data received")
-                return None
-
-            # Convert to DataFrame
-            df = pd.DataFrame(klines, columns=[
-                'timestamp', 'open', 'high', 'low', 'close', 'volume'
-            ])
-
-            # Convert timestamp to datetime
-            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-
-            # Add missing columns for compatibility
-            df['close_time'] = df['timestamp'] + pd.Timedelta(minutes=1)
-            df['quote_volume'] = df['volume'] * df['close']
-            df['trades'] = 0
-            df['taker_buy_volume'] = df['volume'] * 0.5
-            df['taker_buy_quote_volume'] = df['taker_buy_volume'] * df['close']
-            df['ignore'] = 0
-
-            # Convert types
-            numeric_cols = ['open', 'high', 'low', 'close', 'volume', 'quote_volume', 'taker_buy_volume', 'taker_buy_quote_volume']
-            df[numeric_cols] = df[numeric_cols].astype(float)
-
-            return df
-
-        except ccxt.AuthenticationError as e:
-            logger.error(f"Authentication error accessing exchange: {e}")
-            return None
-        except ccxt.ExchangeError as e:
-            logger.error(f"Exchange error: {e}")
-            return None
-        except ccxt.NetworkError as e:
-            logger.error(f"Network error connecting to exchange: {e}")
-            # Implement retry logic
-            time.sleep(5)  # Wait before retry
-            try:
-                klines = self.exchange.fetch_ohlcv(symbol_ccxt, timeframe='1m', limit=350)
-                # Process data similarly
-                df = pd.DataFrame(klines, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-                df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-                df['close_time'] = df['timestamp'] + pd.Timedelta(minutes=1)
-                df['quote_volume'] = df['volume'] * df['close']
-                df['trades'] = 0
-                df['taker_buy_volume'] = df['volume'] * 0.5
-                df['taker_buy_quote_volume'] = df['taker_buy_volume'] * df['close']
-                df['ignore'] = 0
-                numeric_cols = ['open', 'high', 'low', 'close', 'volume', 'quote_volume', 'taker_buy_volume', 'taker_buy_quote_volume']
-                df[numeric_cols] = df[numeric_cols].astype(float)
-                return df
-            except Exception as retry_e:
-                logger.error(f"Retry failed: {retry_e}")
-                return None
+            binance = ccxt.binance({'enableRateLimit': True})
+            klines = binance.fetch_ohlcv(symbol_ccxt, timeframe=timeframe, limit=limit)
+            if klines:
+                logger.info("Successfully fetched data from Binance fallback")
+                return klines
         except Exception as e:
-            logger.error(f"Unexpected error getting market data: {e}")
-            return None
+            logger.warning(f"Binance fallback failed: {e}")
+        return None
+
+    def _process_klines_to_df(self, klines):
+        """Convert klines to DataFrame with proper format"""
+        df = pd.DataFrame(klines, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        df['close_time'] = df['timestamp'] + pd.Timedelta(minutes=1)
+        df['quote_volume'] = df['volume'] * df['close']
+        df['trades'] = 0
+        df['taker_buy_volume'] = df['volume'] * 0.5
+        df['taker_buy_quote_volume'] = df['taker_buy_volume'] * df['close']
+        df['ignore'] = 0
+        numeric_cols = ['open', 'high', 'low', 'close', 'volume', 'quote_volume', 'taker_buy_volume', 'taker_buy_quote_volume']
+        df[numeric_cols] = df[numeric_cols].astype(float)
+        return df
+
+    def get_market_data(self):
+        """Get current market data with fallback to Binance public API"""
+        symbol_ccxt = self.symbol.replace('-', '/')
+        
+        # Try BingX first
+        try:
+            klines = self.exchange.fetch_ohlcv(symbol_ccxt, timeframe='1m', limit=350)
+            if klines:
+                logger.debug("Successfully fetched data from BingX")
+                return self._process_klines_to_df(klines)
+        except Exception as e:
+            logger.warning(f"BingX fetch failed: {e}")
+        
+        # Fallback 1: Try Binance public API
+        logger.info("Trying Binance public API fallback...")
+        klines = self._fetch_from_binance(symbol_ccxt)
+        if klines:
+            return self._process_klines_to_df(klines)
+        
+        # Fallback 2: Try alternative BingX endpoint
+        try:
+            logger.info("Trying alternative BingX endpoint...")
+            binance_exchange = ccxt.bingx({
+                'apiKey': self.api_key,
+                'secret': self.secret_key,
+                'enableRateLimit': True,
+                'options': {'defaultType': 'spot'}
+            })
+            klines = binance_exchange.fetch_ohlcv(symbol_ccxt, timeframe='1m', limit=350)
+            if klines:
+                logger.info("Successfully fetched data from BingX spot")
+                return self._process_klines_to_df(klines)
+        except Exception as e:
+            logger.warning(f"BingX spot fallback failed: {e}")
+        
+        # Fallback 3: Use cached data if available
+        if len(self.market_data_buffer) >= 300:
+            logger.warning("Using cached market data due to API failures")
+            return self.market_data_buffer.copy()
+        
+        logger.error("All market data sources failed")
+        return None
 
     def calculate_indicators(self, df):
         """Calculate technical indicators matching feature_engineer.py"""
         try:
             # Validate minimum data requirements
             min_candles = len(df)
-            logger.info(f"Available candles: {min_candles}")
 
             # Define minimum requirements for different indicator types
             requirements = {
@@ -404,27 +473,39 @@ class RLLiveTradingBot:
             trade_executed = False
 
             if action == 1:  # Buy Long - открыть/добавить длинную позицию
-                # Limit position size to 50% of initial balance
-                max_position_value = self.initial_balance * 0.5
-                current_position_value = self.long_position * current_price
-                available_for_long = max_position_value - current_position_value
-
-                invest_amount = min(self.balance * 0.2, available_for_long)  # 20% от баланса
-                if invest_amount > 10:  # Minimum trade
+                # Risk management: Limit long position size
+                max_long_value = self.initial_balance * 0.7  # Maximum 70% of initial balance in long positions
+                current_long_value = self.long_position * current_price
+                available_for_long = max_long_value - current_long_value
+                
+                # Calculate position size with risk limits
+                invest_amount = min(self.balance * 0.2, available_for_long, 200)  # Max 20% of balance, max $200, respect limits
+                
+                if invest_amount > 10 and available_for_long > 0:  # Minimum trade $10 and check limits
                     fee = self.calculate_fee(invest_amount)
-                    if self.balance >= invest_amount:  # Check sufficient funds
+                    # Check if we can afford the fee and investment
+                    if self.balance >= invest_amount + fee:
                         btc_amount = (invest_amount - fee) / current_price
+
+                        # Risk check: Don't open if already heavily long
+                        if self.long_position > 0:
+                            current_long_exposure = self.long_position * current_price
+                            if current_long_exposure > self.initial_balance * 0.8:  # 80% exposure limit
+                                logger.warning(f"⚠️  Long position exposure too high: ${current_long_exposure:.2f}, skipping new long")
+                                return False
 
                         # Update long position with correct average price calculation
                         old_position_value = self.long_entry_price * self.long_position
                         new_position_value = current_price * btc_amount
                         total_value = old_position_value + new_position_value
-                        self.long_position += btc_amount
-                        self.long_entry_price = total_value / self.long_position if self.long_position > 0 else current_price
+                        total_btc = self.long_position + btc_amount
+                        self.long_position = total_btc
+                        if total_btc > 0:
+                            self.long_entry_price = total_value / total_btc
 
                         # Update overall position
                         self.position = self.long_position - self.short_position
-                        self.balance -= invest_amount
+                        self.balance -= invest_amount + fee
                         self.total_fees += fee
 
                         # Reset trailing parameters for long position
@@ -446,6 +527,7 @@ class RLLiveTradingBot:
                         }
 
                         self.trades.append(trade)
+                        self.log_trade_to_csv(trade)
                         trade_executed = True
 
                         logger.info(f"VIRTUAL BUY LONG: {btc_amount:.6f} BTC at ${current_price:.2f}, Long Position: {self.long_position:.6f}, Long avg price: ${self.long_entry_price:.2f}")
@@ -453,72 +535,104 @@ class RLLiveTradingBot:
 
             elif action == 2:  # Sell Long - закрыть часть длинной позиции
                 if self.long_position > 0:
-                    sell_amount = min(self.long_position * 0.5, self.long_position)  # Sell max 50% of long position
-                    if sell_amount * current_price > 10:  # Minimum trade value
-                        revenue = sell_amount * current_price
-                        fee = self.calculate_fee(revenue)
-                        revenue_after_fee = revenue - fee
+                    # Always close the entire long position when signaled
+                    sell_amount = self.long_position
+                    revenue = sell_amount * current_price
+                    fee = self.calculate_fee(revenue)
+                    revenue_after_fee = revenue - fee
 
-                        pnl = (current_price - self.long_entry_price) * sell_amount - fee
+                    pnl = (current_price - self.long_entry_price) * sell_amount - fee
 
-                        # Update long position
-                        self.long_position -= sell_amount
+                    # Update long position
+                    self.long_position = 0
 
-                        # Update overall position
-                        self.position = self.long_position - self.short_position
-                        self.balance += revenue_after_fee
-                        self.total_fees += fee
+                    # Update overall position
+                    self.position = self.long_position - self.short_position
+                    self.balance += revenue_after_fee
+                    self.total_fees += fee
 
-                        # Update cumulative P&L
-                        self.cumulative_pnl += pnl
+                    # Update cumulative P&L
+                    self.cumulative_pnl += pnl
 
-                        # Reset trailing parameters if position closed
-                        if self.long_position == 0:
-                            self.highest_price_since_entry = 0
-                            self.trailing_stop_loss = 0
-                            self.trailing_take_profit = 0
+                    # Reset trailing parameters
+                    self.highest_price_since_entry = 0
+                    self.trailing_stop_loss = 0
+                    self.trailing_take_profit = 0
 
-                        trade = {
-                            'timestamp': datetime.now(),
-                            'type': 'SELL_LONG',
-                            'price': current_price,
-                            'amount': sell_amount,
-                            'value': revenue_after_fee,
-                            'fee': fee,
-                            'pnl': pnl,
-                            'cumulative_pnl': self.cumulative_pnl,
-                            'balance_after': self.balance,
-                            'position_after': self.position,
-                            'long_position': self.long_position,
-                            'short_position': self.short_position
-                        }
+                    trade = {
+                        'timestamp': datetime.now(),
+                        'type': 'SELL_LONG',
+                        'price': current_price,
+                        'amount': sell_amount,
+                        'value': revenue_after_fee,
+                        'fee': fee,
+                        'pnl': pnl,
+                        'cumulative_pnl': self.cumulative_pnl,
+                        'balance_after': self.balance,
+                        'position_after': self.position,
+                        'long_position': self.long_position,
+                        'short_position': self.short_position
+                    }
 
-                        self.trades.append(trade)
-                        trade_executed = True
+                    self.trades.append(trade)
+                    self.log_trade_to_csv(trade)
+                    trade_executed = True
 
-                        logger.info(f"VIRTUAL SELL LONG: {sell_amount:.6f} BTC at ${current_price:.2f}, Trade PnL: ${pnl:.2f}, Cumulative P&L: ${self.cumulative_pnl:.2f}")
-                        self.last_trade_time = current_time
+                    logger.info(f"VIRTUAL SELL LONG: {sell_amount:.6f} BTC at ${current_price:.2f}, Trade PnL: ${pnl:.2f}, Cumulative P&L: ${self.cumulative_pnl:.2f}")
+                    self.last_trade_time = current_time
 
             elif action == 3:  # Sell Short - открыть короткую позицию
-                # Check if we can afford to open short
-                short_value = min(self.balance * 0.1, self.balance)  # Max 10% of balance equivalent
-                if short_value > 10:  # Minimum trade
+                # Risk management: Limit short position size
+                max_short_value = self.initial_balance * 0.5  # Maximum 50% of initial balance in short positions
+                current_short_value = self.short_position * current_price
+                available_for_short = max_short_value - current_short_value
+                
+                # Calculate position size with risk limits
+                short_value = min(self.balance * 0.1, available_for_short, 100)  # Max 10% of balance, max $100, respect limits
+                
+                if short_value > 10 and available_for_short > 0:  # Minimum trade $10 and check limits
                     fee = self.calculate_fee(short_value)
-                    # Just check if we can afford the fee (more realistic margin check)
-                    if self.balance >= fee:  # Can afford transaction fee
-                        btc_amount = (short_value - fee) / current_price
+                    
+                    # Calculate margin required for short position
+                    margin_required = short_value * self.margin_requirement
+                    available_balance = self.balance - self.margin_locked
+                    
+                    if available_balance >= margin_required:
+                        btc_amount = short_value / current_price
+                        
+                        # Store opening fee to avoid double-counting on cover
+                        self.short_opening_fees = fee
+
+                        # Lock margin and receive proceeds (proceeds go to balance, but we owe btc_amount)
+                        self.margin_locked += margin_required
+                        self.balance -= margin_required
+                        self.balance += short_value - fee  # Receive proceeds minus fee
+                        self.short_position += btc_amount
+                        self.total_fees += fee
+
+                        # Risk check: Don't open if already heavily shorted
+                        if self.short_position > 0:
+                            current_short_exposure = self.short_position * current_price
+                            if current_short_exposure > self.initial_balance * 0.8:  # 80% exposure limit
+                                logger.warning(f"⚠️  Short position exposure too high: ${current_short_exposure:.2f}, skipping new short")
+                                # Rollback the changes
+                                self.margin_locked -= margin_required
+                                self.balance += margin_required
+                                self.balance -= short_value - fee
+                                self.short_position -= btc_amount
+                                self.total_fees -= fee
+                                return False
 
                         # Update short position with correct average price calculation
-                        old_position_value = self.short_entry_price * self.short_position
+                        old_position_value = self.short_entry_price * (self.short_position - btc_amount)
                         new_position_value = current_price * btc_amount
                         total_value = old_position_value + new_position_value
-                        self.short_position += btc_amount
-                        self.short_entry_price = total_value / self.short_position if self.short_position > 0 else current_price
+                        total_btc = self.short_position
+                        if total_btc > 0:
+                            self.short_entry_price = total_value / total_btc
 
-                        # Update overall position
+                        # Update overall position (negative because it's short)
                         self.position = self.long_position - self.short_position
-                        self.balance += short_value  # Receive money for shorting
-                        self.total_fees += fee
 
                         # Reset trailing parameters for short position
                         self.lowest_price_since_entry = current_price
@@ -532,6 +646,8 @@ class RLLiveTradingBot:
                             'amount': btc_amount,
                             'value': short_value,
                             'fee': fee,
+                            'pnl': 0,  # No P&L on entry for short
+                            'cumulative_pnl': self.cumulative_pnl,
                             'balance_after': self.balance,
                             'position_after': self.position,
                             'long_position': self.long_position,
@@ -539,64 +655,80 @@ class RLLiveTradingBot:
                         }
 
                         self.trades.append(trade)
+                        self.log_trade_to_csv(trade)
                         trade_executed = True
 
-                        logger.info(f"VIRTUAL SELL SHORT: {btc_amount:.6f} BTC at ${current_price:.2f}, Short Position: {self.short_position:.6f}")
+                        logger.info(f"VIRTUAL SELL SHORT: {btc_amount:.6f} BTC at ${current_price:.2f}, Short Position: {self.short_position:.6f}, Short avg price: ${self.short_entry_price:.2f}, Margin Locked: ${self.margin_locked:.2f}")
                         self.last_trade_time = current_time
+                    else:
+                        logger.warning(f"Insufficient margin to open short position. Need: ${margin_required:.2f}, Available: ${available_balance:.2f}")
+                        return False
 
             elif action == 4:  # Buy Short - закрыть короткую позицию
                 if self.short_position > 0:  # Have short position
-                    cover_amount = min(self.short_position * 0.5, self.short_position)  # Cover max 50% short
-                    if cover_amount * current_price > 10:  # Minimum trade value
-                        cost = cover_amount * current_price
-                        fee = self.calculate_fee(cost)
-                        cost_with_fee = cost + fee
+                    # Always close the entire short position when signaled
+                    cover_amount = self.short_position
+                    cost = cover_amount * current_price
+                    fee = self.calculate_fee(cost)
+                    cost_with_fee = cost + fee
 
-                        if self.balance >= cost_with_fee:  # Check sufficient funds to cover
-                            # ПРАВИЛЬНЫЙ РАСЧЕТ P&L ДЛЯ ШОРТА
-                            entry_price = self.short_entry_price if self.short_entry_price > 0 else current_price
-                            pnl = (entry_price - current_price) * cover_amount - fee
+                    # Calculate PnL for short position
+                    # Price PnL: we sold at entry_price, buying back at current_price
+                    price_pnl = (self.short_entry_price - current_price) * cover_amount
+                    
+                    # Use stored opening fee instead of recalculating
+                    open_fee = self.short_opening_fees
+                    close_fee = self.calculate_fee(cost)
+                    total_fee = close_fee  # Opening fee already counted
+                    
+                    pnl = price_pnl - close_fee  # Opening fee already deducted from balance
 
-                            # Update short position
-                            self.short_position -= cover_amount
+                    # Check sufficient margin to cover the position
+                    if self.balance >= cost_with_fee:  # Check if we have enough to cover
+                        # Update short position
+                        self.short_position = 0
 
-                            # Update overall position
-                            self.position = self.long_position - self.short_position
-                            self.balance -= cost_with_fee  # Pay to cover short
-                            self.total_fees += fee
+                        # Return margin + PnL (opening fee was already deducted when opening)
+                        self.balance += self.margin_locked + pnl
+                        self.margin_locked = 0
+                        self.total_fees += close_fee # Only count closing fee here
+                        self.short_opening_fees = 0.0  # Reset
 
-                            # Update cumulative P&L
-                            self.cumulative_pnl += pnl
+                        # Update overall position
+                        self.position = self.long_position - self.short_position
 
-                            # Reset trailing parameters if position closed
-                            if self.short_position == 0:
-                                self.lowest_price_since_entry = float('inf')
-                                self.trailing_stop_loss = 0
-                                self.trailing_take_profit = 0
+                        # Update cumulative P&L
+                        self.cumulative_pnl += pnl
 
-                            trade = {
-                                'timestamp': datetime.now(),
-                                'type': 'BUY_SHORT',
-                                'price': current_price,
-                                'amount': cover_amount,
-                                'value': cost_with_fee,
-                                'fee': fee,
-                                'pnl': pnl,
-                                'cumulative_pnl': self.cumulative_pnl,
-                                'balance_after': self.balance,
-                                'position_after': self.position,
-                                'long_position': self.long_position,
-                                'short_position': self.short_position
-                            }
+                        # Reset trailing parameters
+                        self.lowest_price_since_entry = float('inf')
+                        self.trailing_stop_loss = 0
+                        self.trailing_take_profit = 0
 
-                            self.trades.append(trade)
-                            trade_executed = True
+                        trade = {
+                            'timestamp': datetime.now(),
+                            'type': 'BUY_SHORT',
+                            'price': current_price,
+                            'amount': cover_amount,
+                            'value': cost_with_fee,
+                            'fee': fee,
+                            'pnl': pnl,
+                            'cumulative_pnl': self.cumulative_pnl,
+                            'balance_after': self.balance,
+                            'position_after': self.position,
+                            'long_position': self.long_position,
+                            'short_position': self.short_position
+                        }
 
-                            logger.info(f"VIRTUAL BUY SHORT: {cover_amount:.6f} BTC at ${current_price:.2f}, Trade PnL: ${pnl:.2f}, Cumulative P&L: ${self.cumulative_pnl:.2f}")
-                            self.last_trade_time = current_time
-                        else:
-                            logger.warning("Insufficient funds to cover short position")
-                            return False
+                        self.trades.append(trade)
+                        self.log_trade_to_csv(trade)
+                        trade_executed = True
+
+                        logger.info(f"VIRTUAL BUY SHORT: {cover_amount:.6f} BTC at ${current_price:.2f}, Trade PnL: ${pnl:.2f}, Cumulative P&L: ${self.cumulative_pnl:.2f}, Margin Unlocked: ${self.margin_locked:.2f}")
+                        self.last_trade_time = current_time
+                    else:
+                        logger.warning(f"Insufficient funds to cover short position. Need: ${cost_with_fee:.2f}, Have: ${self.balance:.2f}")
+                        return False
 
             return trade_executed
 
@@ -753,7 +885,10 @@ class RLLiveTradingBot:
                 elapsed_minutes = (datetime.now() - start_time).total_seconds() / 60
                 if elapsed_minutes % 1 < 0.1 and int(elapsed_minutes) > 0 and int(elapsed_minutes) != getattr(on_message, 'last_progress_min', 0):
                     on_message.last_progress_min = int(elapsed_minutes)
-                    portfolio_value = self.balance + (self.position * (last_price or self.initial_balance))
+                    # Calculate portfolio value that accounts for margin trading
+                    # Portfolio = Available Balance + Margin Locked + Position_Value
+                    position_value = self.position * (last_price or self.initial_balance) if self.position != 0 else 0
+                    portfolio_value = self.balance + self.margin_locked + position_value
                     pnl = portfolio_value - self.initial_balance
                     logger.info(f"Session Progress: {elapsed_minutes:.0f}min | Portfolio: ${portfolio_value:.2f} | P&L: ${pnl:.2f} | Trades: {len(self.trades)}")
 
@@ -810,8 +945,11 @@ class RLLiveTradingBot:
             # Execute virtual trade
             trade_executed = self.execute_virtual_trade(action, current_price)
 
-            # Record portfolio state
-            portfolio_value = self.balance + (self.position * current_price)
+            # Record portfolio state - calculate correctly for margin trading
+            # For margin trading, portfolio value = balance + margin_locked + position_value
+            # Position value should account for short positions (negative for shorts)
+            position_value = self.position * current_price
+            portfolio_value = self.balance + self.margin_locked + position_value
             self.portfolio_history.append({
                 'timestamp': datetime.now(),
                 'price': current_price,
@@ -991,20 +1129,33 @@ class RLLiveTradingBot:
                         fee = self.calculate_fee(cost_to_cover)
                         total_cost = cost_to_cover + fee
 
-                        # Profit from short: (entry_price - exit_price) * amount - fee
-                        pnl = (self.short_entry_price - current_price) * self.short_position - fee
+                        # Calculate PnL for short position
+                        # Price PnL: we sold at entry_price, buying back at current_price
+                        price_pnl = (self.short_entry_price - current_price) * self.short_position
+                        
+                        # Use stored opening fee instead of recalculating
+                        open_fee = self.short_opening_fees
+                        close_fee = self.calculate_fee(cost_to_cover)
+                        total_fee = close_fee  # Opening fee already counted
+                        
+                        pnl = price_pnl - close_fee  # Opening fee already deducted from balance
 
                         # Handle potential deficit (if price went up too much)
                         if self.balance >= total_cost:
-                            self.balance -= total_cost
+                            # Return margin + PnL (opening fee was already deducted when opening)
+                            self.balance = self.balance + self.margin_locked - total_cost
+                            self.margin_locked = 0
+                            self.total_fees += close_fee  # Only closing fee
+                            self.short_opening_fees = 0.0  # Reset
                         else:
                             # Short position default - price went against us too much
-                            deficit = total_cost - self.balance
+                            deficit = total_cost - (self.balance + self.margin_locked)
                             self.balance = 0  # Balance cannot be negative
+                            self.margin_locked = 0  # Release margin
+                            self.short_opening_fees = 0.0  # Reset fees
                             self.cumulative_pnl -= deficit  # Additional loss from deficit
                             logger.error(f"🚨 SHORT POSITION DEFAULT! Deficit: ${deficit:.2f}")
 
-                        self.total_fees += fee
                         self.cumulative_pnl += pnl
 
                         trigger_type = "STOP-LOSS" if stop_loss_triggered else "TAKE-PROFIT"
@@ -1050,22 +1201,19 @@ class RLLiveTradingBot:
                 if isinstance(action, (np.ndarray, torch.Tensor)):
                     action = int(action.item())
 
-                # Get action probabilities and log them
+                # Get action probabilities (but don't log them)
                 state_tensor = torch.tensor(state.reshape(1, -1), dtype=torch.float32)
                 dist = self.model.policy.get_distribution(state_tensor)
                 action_probs = dist.distribution.probs[0].detach().numpy()
-                logger.info(f"Action weights: Hold={action_probs[0]:.4f}, Buy_Long={action_probs[1]:.4f}, Sell_Long={action_probs[2]:.4f}, Sell_Short={action_probs[3]:.4f}, Buy_Short={action_probs[4]:.4f}")
-
-                # Determine action name for logging
-                action_names = {0: 'HOLD', 1: 'BUY_LONG', 2: 'SELL_LONG', 3: 'SELL_SHORT', 4: 'BUY_SHORT'}
-                logger.info(f"Current price: ${current_price:.2f}")
-                logger.info(f"Chosen action: {action_names.get(action, f'UNKNOWN({action})')}")
 
                 # Execute virtual trade
                 trade_executed = self.execute_virtual_trade(action, current_price)
 
-                # Record portfolio state
-                portfolio_value = self.balance + (self.position * current_price)
+                # Record portfolio state - calculate correctly for margin trading
+                # For margin trading, portfolio value = balance + margin_locked + position_value
+                # Position value should account for short positions (negative for shorts)
+                position_value = self.position * current_price
+                portfolio_value = self.balance + self.margin_locked + position_value
                 self.portfolio_history.append({
                     'timestamp': datetime.now(),
                     'price': current_price,
@@ -1096,7 +1244,14 @@ class RLLiveTradingBot:
                     total_realized_pnl = self.cumulative_pnl
                     total_pnl = total_realized_pnl + total_unrealized_pnl
                     
-                    logger.info(f"Session Progress: {elapsed_minutes:.1f}min | Portfolio: ${portfolio_value:.2f} | Balance: ${self.balance:.2f} | Long: {self.long_position:+.6f} BTC @${self.long_entry_price:.2f} (P&L: ${long_unrealized_pnl:+.2f}) | Short: {self.short_position:+.6f} BTC @${self.short_entry_price:.2f} (P&L: ${short_unrealized_pnl:+.2f}) | Net: {self.position:+.6f} BTC | Realized P&L: ${self.cumulative_pnl:+.2f} ({pnl_pct:+.2f}%) | Unrealized P&L: ${total_unrealized_pnl:+.2f} | Total P&L: ${total_pnl:+.2f} | Trades: {len(self.trades)}")
+                    # Calculate portfolio value that accounts for margin trading
+                    # Portfolio = Available Balance + Margin Locked + Position_Value
+                    # Position value should account for short positions (negative for shorts)
+                    position_value = self.position * current_price
+                    portfolio_value = self.balance + self.margin_locked + position_value
+                    
+                    # Create static dashboard display
+                    self.display_dashboard(current_price, portfolio_value, elapsed_minutes)
 
                 # Wait before next iteration (configurable interval)
                 time.sleep(check_interval_seconds)
@@ -1107,6 +1262,72 @@ class RLLiveTradingBot:
 
         logger.info("RL Live trading session completed")
         self.generate_report()
+
+    def display_dashboard(self, current_price, portfolio_value, elapsed_minutes):
+        """Display static dashboard with colored blocks"""
+        try:
+            import sys
+            
+            # Calculate metrics
+            pnl = portfolio_value - self.initial_balance
+            pnl_pct = (pnl / self.initial_balance) * 100
+            
+            # Calculate unrealized P&L for current positions
+            long_unrealized_pnl = 0
+            short_unrealized_pnl = 0
+            if self.long_position > 0 and self.long_entry_price > 0:
+                long_unrealized_pnl = (current_price - self.long_entry_price) * self.long_position
+            if self.short_position > 0 and self.short_entry_price > 0:
+                short_unrealized_pnl = (self.short_entry_price - current_price) * self.short_position
+            
+            total_unrealized_pnl = long_unrealized_pnl + short_unrealized_pnl
+            total_realized_pnl = self.cumulative_pnl
+            total_pnl = total_realized_pnl + total_unrealized_pnl
+            
+            # Color codes
+            GREEN = '\033[92m'
+            RED = '\033[91m'
+            YELLOW = '\033[93m'
+            BLUE = '\033[94m'
+            CYAN = '\033[96m'
+            BOLD = '\033[1m'
+            RESET = '\033[0m'
+            WHITE = '\033[97m'
+            
+            # Determine colors based on values
+            pnl_color = GREEN if pnl >= 0 else RED
+            pnl_symbol = "▲" if pnl >= 0 else "▼"
+            
+            long_color = GREEN if long_unrealized_pnl >= 0 else RED
+            short_color = GREEN if short_unrealized_pnl >= 0 else RED
+            
+            # Build dashboard
+            dashboard = f"""
+{BOLD}{CYAN}╔══════════════════════════════════════════════════════════════════════════════╗{RESET}
+{BOLD}{CYAN}║                           🤖 RL TRADING DASHBOARD                           ║{RESET}
+{BOLD}{CYAN}╠══════════════════════════════════════════════════════════════════════════════╣{RESET}
+{BOLD}{CYAN}║{RESET} {BOLD}{WHITE}TIME:{RESET} {elapsed_minutes:6.1f}min {BOLD}{WHITE}|{RESET} {BOLD}{WHITE}PRICE:{RESET} ${current_price:10,.2f} {BOLD}{WHITE}|{RESET} {BOLD}{WHITE}TRADES:{RESET} {len(self.trades):3d} {BOLD}{CYAN}║{RESET}
+{BOLD}{CYAN}╠══════════════════════════════════════════════════════════════════════════════╣{RESET}
+{BOLD}{CYAN}║{RESET} {BOLD}{WHITE}BALANCE:{RESET} ${self.balance:10,.2f} {BOLD}{WHITE}|{RESET} {BOLD}{WHITE}POSITION:{RESET} {self.position:+8.6f} BTC {BOLD}{CYAN}║{RESET}
+{BOLD}{CYAN}║{RESET} {BOLD}{WHITE}LONG:{RESET} {self.long_position:+12.6f} BTC @${self.long_entry_price:8.2f} {BOLD}{CYAN}║{RESET}
+{BOLD}{CYAN}║{RESET} {BOLD}{WHITE}SHORT:{RESET} {self.short_position:+11.6f} BTC @${self.short_entry_price:8.2f} {BOLD}{CYAN}║{RESET}
+{BOLD}{CYAN}╠══════════════════════════════════════════════════════════════════════════════╣{RESET}
+{BOLD}{CYAN}║{RESET} {BOLD}{WHITE}PORTFOLIO:{RESET} ${portfolio_value:10,.2f} {BOLD}{WHITE}|{RESET} {BOLD}{WHITE}P&L:{RESET} {pnl_color}{pnl_symbol}{pnl:+8.2f}{RESET} ({pnl_color}{pnl_pct:+6.2f}%{RESET}) {BOLD}{CYAN}║{RESET}
+{BOLD}{CYAN}║{RESET} {BOLD}{WHITE}REALIZED:{RESET} {pnl_color}{total_realized_pnl:+8.2f}{RESET} {BOLD}{WHITE}|{RESET} {BOLD}{WHITE}UNREALIZED:{RESET} {pnl_color}{total_unrealized_pnl:+8.2f}{RESET} {BOLD}{CYAN}║{RESET}
+{BOLD}{CYAN}║{RESET} {BOLD}{WHITE}LONG P&L:{RESET} {long_color}{long_unrealized_pnl:+8.2f}{RESET} {BOLD}{WHITE}|{RESET} {BOLD}{WHITE}SHORT P&L:{RESET} {short_color}{short_unrealized_pnl:+8.2f}{RESET} {BOLD}{CYAN}║{RESET}
+{BOLD}{CYAN}║{RESET} {BOLD}{WHITE}TOTAL P&L:{RESET} {pnl_color}{total_pnl:+8.2f}{RESET} {BOLD}{WHITE}|{RESET} {BOLD}{WHITE}FEES:{RESET} ${self.total_fees:8.2f} {BOLD}{CYAN}║{RESET}
+{BOLD}{CYAN}╠══════════════════════════════════════════════════════════════════════════════╣{RESET}
+{BOLD}{CYAN}║{RESET} {BOLD}{WHITE}STATUS:{RESET} {GREEN if portfolio_value >= self.initial_balance else RED}{'🟢 PROFITABLE' if portfolio_value >= self.initial_balance else '🔴 IN LOSS'}{RESET} {BOLD}{WHITE}|{RESET} {BOLD}{WHITE}MARGIN:{RESET} {YELLOW if self.balance < 500 else GREEN}{self.balance:.2f} USDT{RESET} {BOLD}{CYAN}║{RESET}
+{BOLD}{CYAN}╚══════════════════════════════════════════════════════════════════════════════╝{RESET}
+"""
+            
+            # Clear screen and print dashboard
+            sys.stdout.write('\033[2J\033[H')  # Clear screen and move cursor to top
+            sys.stdout.write(dashboard)
+            sys.stdout.flush()
+            
+        except Exception as e:
+            logger.error(f"Error displaying dashboard: {e}")
 
     def generate_report(self):
         """Generate trading report"""
@@ -1216,7 +1437,7 @@ def main():
                        help="Path to trained RL model")
     parser.add_argument("--symbol", default="BTC-USDT",
                        help="Trading symbol")
-    parser.add_argument("--duration", type=int, default=60,
+    parser.add_argument("--duration", type=int, default=2880,  # 2 days = 4
                        help="Trading duration in minutes")
     parser.add_argument("--balance", type=float, default=1000,
                        help="Initial virtual balance")

@@ -94,8 +94,8 @@ def feature_engineer():
 
 def train_rl(timesteps=100000):
     """Шаг 4: Обучение RL модели"""
-    command = f"python3 train_rl.py --timesteps {timesteps}"
-    return run_command(command, f"Обучение RL агента ({timesteps} шагов)")[0]
+    command = f"python3 train_rl_balanced.py --timesteps {timesteps}"
+    return run_command(command, f"Обучение RL агента с балансировкой стратегии ({timesteps} шагов)")[0]
 
 def evaluate_model():
     """Оценка обученной модели"""

@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!.venv/bin/ python3
 """
 Unified Trading Environment for Reinforcement Learning
 Implements a standardized trading environment that can be used across training, paper trading, and live trading
@@ -29,11 +29,23 @@ class TradingEnvironment(gym.Env):
         self.start_step = start_step  # For random episode start
         self.debug = debug  # Control debug prints
 
-        # Risk management parameters
-        self.max_position_size = 0.25  # Max 25% of balance per position
-        self.max_total_exposure = 0.5  # Max 50% of balance in total exposure
+        # Enhanced risk management parameters
+        self.max_position_size = 0.15  # Max 15% of balance per position (reduced from 25%)
+        self.max_total_exposure = 0.40  # Max 40% of balance in total exposure (reduced from 50%)
         self.stop_loss_pct = 0.08  # Stop loss at 8%
         self.take_profit_pct = 0.15  # Take profit at 15%
+        self.max_episode_loss_pct = 0.05  # Maximum 5% loss per episode
+        
+        # Dynamic position sizing parameters
+        self.volatility_window = 20  # Window for volatility calculation
+        self.min_position_size = 0.02  # Minimum 2% position size
+        self.max_dynamic_position_size = 0.20  # Maximum 20% dynamic position size
+        
+        # Adaptive stop-loss parameters
+        self.adaptive_stop_loss_enabled = True
+        self.atr_multiplier = 2.0  # ATR multiplier for stop loss
+        self.min_stop_loss_pct = 0.03  # Minimum 3% stop loss
+        self.max_stop_loss_pct = 0.15  # Maximum 15% stop loss
         
         # Margin trading parameters
         self.margin_requirement = 0.3  # 30% initial margin for shorts
@@ -45,17 +57,24 @@ class TradingEnvironment(gym.Env):
         self.trailing_stop_enabled = True
 
         # Trading parameters
-        self.base_position_size = 0.1  # 10% of balance
+        self.base_position_size = 0.08  # Reduced to 8% of balance (dynamic sizing will adjust)
         self.hold_penalty = 0.00001  # Much smaller penalty for holding (was 0.0001)
         self.inactivity_penalty = 0.0001  # Much smaller penalty for not trading (was 0.001)
-        self.termination_stop_loss_threshold = 0.70  # Stop if balance drops to 70%
+        
+        # Directional balance tracking for long/short balancing
+        self.long_count = 0
+        self.short_count = 0
+        self.balance_tracking_window = 100
+        self.termination_stop_loss_threshold = 0.95  # Stop if balance drops to 95% (reduced from 70% for early loss control)
         self.termination_profit_target = 1.50  # Stop if balance reaches 150%
 
         # Reward parameters
-        self.reward_clip_bounds = (-500, 500)  # Clip rewards to reasonable bounds
+        self.reward_clip_bounds = (-50, 50)  # Clip rewards to reasonable bounds (reduced from -500, 500)
         self.long_reward_multiplier = 1.2  # Long positions get bonus
         self.short_reward_multiplier = 1.0  # Short positions get normal reward
         self.action_diversity_penalty = 0.001  # Smaller penalty for repetitive actions (was 0.01)
+        self.min_episode_length_for_rewards = 1  # Minimum episode length to get significant rewards (reduced to 1)
+        self.short_episode_penalty = 0.0  # Penalty multiplier for short episodes (removed)
 
         # Action diversity tracking
         self.action_history = []  # Track last 10 actions
@@ -199,6 +218,13 @@ class TradingEnvironment(gym.Env):
         # Track short opening fees to avoid double-counting
         self.short_opening_fees = 0.0
         
+        # Initialize portfolio history list
+        self.portfolio_history = [float(self.initial_balance)]
+        
+        # Initialize previous price for reward calculation
+        current_price = self.df.iloc[self.current_step].get('close', self.df.iloc[self.current_step].get('Close', 500))
+        self.prev_price = current_price
+        
         # Ensure we don't start beyond data boundaries
         if self.current_step >= len(self.df):
             self.current_step = max(0, len(self.df) - 1)
@@ -301,14 +327,51 @@ class TradingEnvironment(gym.Env):
         state = np.clip(state, self.observation_space.low, self.observation_space.high)
         return state
 
+    def _calculate_volatility_based_position_size(self, current_price):
+        """Calculate position size based on market volatility"""
+        if self.current_step < self.volatility_window:
+            return self.base_position_size  # Use base size if not enough data
+        
+        # Get recent price data for volatility calculation
+        start_idx = max(0, self.current_step - self.volatility_window)
+        recent_prices = self.df.iloc[start_idx:self.current_step + 1]
+        
+        price_col = 'close' if 'close' in recent_prices.columns else 'Close'
+        prices = recent_prices[price_col].values
+        
+        if len(prices) < 2:
+            return self.base_position_size
+        
+        # Calculate returns
+        returns = np.diff(prices) / prices[:-1]
+        volatility = np.std(returns) if len(returns) > 0 else 0.01
+        
+        # Normalize volatility (higher volatility = smaller position size)
+        avg_volatility = 0.02  # Historical average volatility assumption
+        volatility_factor = avg_volatility / (volatility + 0.001)  # Add small epsilon to avoid division by zero
+        
+        # Clamp the factor to reasonable bounds
+        volatility_factor = np.clip(volatility_factor, 0.5, 2.0)  # Between 50% and 200% of base size
+        
+        # Calculate dynamic position size
+        dynamic_size = self.base_position_size * volatility_factor
+        dynamic_size = np.clip(dynamic_size, self.min_position_size, self.max_dynamic_position_size)
+        
+        return dynamic_size
+
     def _get_position_sizes(self):
-        """Calculate position sizes for orders"""
-        # Calculate max position sizes based on risk management
-        max_order_size_long = min(self.balance * self.base_position_size, 
+        """Calculate position sizes for orders with volatility adjustment"""
+        # Calculate dynamic position size based on current market volatility
+        dynamic_position_size = self._calculate_volatility_based_position_size(
+            self.df.iloc[self.current_step].get('close', self.df.iloc[self.current_step].get('Close'))
+        )
+        
+        # Calculate max position sizes based on risk management with dynamic sizing
+        max_order_size_long = min(self.balance * dynamic_position_size, 
                                  self.balance * self.max_position_size,
                                  (self.initial_balance * self.max_total_exposure - abs(self.position * self.df.iloc[self.current_step].get('close', self.df.iloc[self.current_step].get('Close'))) if self.position != 0 else self.initial_balance * self.max_total_exposure))
         
-        max_order_size_short = min(self.balance * self.base_position_size * 0.8,  # Slightly more conservative for shorts
+        max_order_size_short = min(self.balance * dynamic_position_size * 0.8,  # Slightly more conservative for shorts
                                    self.balance * self.max_position_size,
                                    (self.initial_balance * self.max_total_exposure - abs(self.position * self.df.iloc[self.current_step].get('close', self.df.iloc[self.current_step].get('Close'))) if self.position != 0 else self.initial_balance * self.max_total_exposure))
         
@@ -407,11 +470,11 @@ class TradingEnvironment(gym.Env):
                 # Store opening fee to avoid double-counting on cover
                 self.short_opening_fees = fee
 
-                # Lock margin and receive proceeds (proceeds go to balance, but we owe coins_short)
+                # Lock margin and receive short proceeds (proceeds increase balance, but we have a liability)
                 self.margin_locked += margin_required
-                self.balance -= margin_required
-                self.balance += short_amount - fee  # Receive proceeds minus fee
-                self.position -= coins_short
+                self.balance -= margin_required  # Lock margin from available balance
+                self.balance += short_amount - fee  # Receive proceeds minus fee (proceeds are liability but temporarily increase balance)
+                self.position -= coins_short  # Update position (negative for short)
                 self.total_fees += fee
                 self.fees_step += fee
 
@@ -490,15 +553,46 @@ class TradingEnvironment(gym.Env):
             return True, pnl_pct
         return False, 0
 
+    def _calculate_adaptive_stop_loss(self, current_price):
+        """Calculate adaptive stop loss based on ATR and market conditions"""
+        if self.current_step < self.volatility_window:
+            # Use fixed stop loss if not enough data for ATR
+            return self.stop_loss_pct
+
+        # Get recent ATR values for adaptive calculation
+        start_idx = max(0, self.current_step - self.volatility_window)
+        recent_data = self.df.iloc[start_idx:self.current_step + 1]
+        
+        atr_col = 'ATR_15' if 'ATR_15' in recent_data.columns else 'ATR'
+        if atr_col in recent_data.columns:
+            recent_atr = recent_data[atr_col].iloc[-1]
+            current_price_val = current_price
+            
+            if recent_atr > 0 and current_price_val > 0:
+                # Calculate stop loss as ATR multiple
+                atr_stop_loss_pct = (recent_atr / current_price_val) * self.atr_multiplier
+                # Clamp between minimum and maximum stop loss percentages
+                adaptive_stop_loss = max(self.min_stop_loss_pct, min(atr_stop_loss_pct, self.max_stop_loss_pct))
+                return adaptive_stop_loss
+        
+        # Fallback to fixed stop loss
+        return self.stop_loss_pct
+
     def _check_trailing_stop(self, current_price):
         """Check and execute trailing stop-loss if triggered"""
         if self.position == 0 or self.entry_price == 0:
             return
 
+        # Calculate adaptive stop loss if enabled
+        if self.adaptive_stop_loss_enabled:
+            adaptive_stop_pct = self._calculate_adaptive_stop_loss(current_price)
+        else:
+            adaptive_stop_pct = self.stop_loss_pct
+
         if self.position > 0:  # Long position
             if current_price > self.highest_price_since_entry:
                 self.highest_price_since_entry = current_price
-                self.trailing_stop_loss = self.highest_price_since_entry * (1 - self.trailing_stop_distance)
+                self.trailing_stop_loss = self.highest_price_since_entry * (1 - adaptive_stop_pct)  # Use adaptive stop loss
 
             # Check trailing stop
             if current_price <= self.trailing_stop_loss:
@@ -532,7 +626,7 @@ class TradingEnvironment(gym.Env):
         elif self.position < 0:  # Short position
             if current_price < self.lowest_price_since_entry:
                 self.lowest_price_since_entry = current_price
-                self.trailing_stop_loss = self.lowest_price_since_entry * (1 + self.trailing_stop_distance)
+                self.trailing_stop_loss = self.lowest_price_since_entry * (1 + adaptive_stop_pct)  # Use adaptive stop loss
 
             # Check trailing stop
             if current_price >= self.trailing_stop_loss:
@@ -573,101 +667,99 @@ class TradingEnvironment(gym.Env):
 
     def _calculate_reward(self, current_price, action, action_performed=False, pnl_pct=None):
         """
-        Улучшенная система наград для стимулирования торговли и прибыли
-
-        Основные принципы:
-        1. Награда за изменение портфеля (основной сигнал)
-        2. Бонус за успешные торговые действия
-        3. Минимальный штраф за бездействие (hold) - стимулируем торговлю
-        4. Бонус за закрытие прибыльных позиций
-        5. Сниженный штраф за комиссии
+        Улучшенная система наград для стимулирования прибыльной торговли
         """
         # Calculate current equity (portfolio value)
         current_portfolio = self.balance + self.margin_locked + self.position * current_price
 
-        # Основная награда: изменение портфеля (log return для лучшего масштабирования)
+        # Базовая награда: изменение портфеля
         if self.prev_portfolio_value > 0:
             portfolio_return = (current_portfolio - self.prev_portfolio_value) / self.prev_portfolio_value
-            # Используем log return для лучшей численной стабильности
-            # Масштабируем для более заметного сигнала
-            reward = np.log(1 + portfolio_return) * 300  # Увеличено с 200 до 300 для большей чувствительности
+            base_reward = portfolio_return * 100  # Увеличен масштаб для лучшей чувствительности
         else:
-            reward = 0.0
+            base_reward = 0.0
 
-        # Значительный бонус за успешно выполненные торговые действия
-        if action_performed:
-            # Бонус за открытие/закрытие позиций
-            if action in [1, 3]:  # Открытие позиций (Buy Long, Sell Short)
-                reward += 3.0  # Увеличено с 1.0 до 3.0
-            elif action in [2, 4]:  # Закрытие позиций (Sell Long, Cover Short)
-                reward += 5.0  # Увеличено с 1.5 до 5.0 - больший бонус за закрытие
+        # Награда за прибыльность сделки (если была выполнена)
+        trade_reward = 0
+        if action_performed and pnl_pct is not None:
+            if pnl_pct > 0:
+                trade_reward = pnl_pct * 100  # Поощрение за положительную прибыль
+            else:
+                trade_reward = pnl_pct * 50   # Меньший штраф за убыток
 
-        # Значительный бонус за закрытие прибыльных позиций
-        if pnl_pct is not None and pnl_pct > 0:
-            # Квадратичный бонус за прибыль (больше прибыль = больше бонус)
-            profit_bonus = min(pnl_pct * 100, 20.0)  # Увеличено с 50 до 100, до 20 бонусных очков
-            reward += profit_bonus
+        # Награда за разнообразие действий
+        action_diversity_reward = 0
+        if len(self.action_history) >= 2:
+            unique_actions = len(set(self.action_history))
+            if unique_actions >= 3:  # Разнообразие действий
+                action_diversity_reward = 0.1
 
-        # Уменьшенный штраф за закрытие убыточных позиций
-        if pnl_pct is not None and pnl_pct < 0:
-            # Линейный штраф за убыток (уменьшен)
-            loss_penalty = max(pnl_pct * 20, -3.0)  # Уменьшено с 30 до 20, до -3 штрафных очков
-            reward += loss_penalty
+        # Штраф за избыточные холды (слишком много бездействия)
+        hold_penalty = 0
+        if action == 0:  # Hold action
+            if self.steps_since_last_trade > 5:  # Если долго не было сделок
+                hold_penalty = -0.05
 
-        # Сниженный штраф за комиссии (чтобы стимулировать торговлю)
-        if self.fees_step > 0:
-            fee_penalty = (self.fees_step / self.prev_portfolio_value) * 10 if self.prev_portfolio_value > 0 else 0  # Уменьшено с 30 до 10
-            reward -= fee_penalty
+        # Награда за стабильность (по сравнению с рынком)
+        market_comparison_reward = 0
+        if hasattr(self, 'prev_price') and self.prev_price > 0:
+            market_return = (current_price - self.prev_price) / self.prev_price
+            excess_return = portfolio_return - market_return
+            if excess_return > 0.001:  # Превышение рынка на 0.1%
+                market_comparison_reward = excess_return * 50
 
-        # Увеличенный штраф за бездействие (hold) для стимулирования торговли
-        if action == 0:  # Hold
-            # Прогрессивный штраф: чем дольше бездействие, тем больше штраф
-            hold_penalty = 0.1 + (self.steps_since_last_trade / 50.0) * 0.5  # Увеличено с 0.01-0.1 до 0.1-0.5
-            reward -= hold_penalty
+        # Пенальти за слишком короткие эпизоды
+        episode_length_penalty = 0
+        if self.steps_in_episode < self.min_episode_length_for_rewards:
+            missing_steps = self.min_episode_length_for_rewards - self.steps_in_episode
+            episode_length_penalty = -missing_steps * 0.2  # Увеличенный штраф
 
-        # Увеличенный штраф за длительное бездействие
-        if self.steps_since_last_trade > 25:  # Уменьшено с 50 до 25 для более быстрого штрафа
-            inactivity_penalty = (self.steps_since_last_trade - 25) * 0.02  # Увеличено с 0.005 до 0.02
-            reward -= inactivity_penalty
+        # Балансировка лонг/шорт - штраф за дисбаланс направлений
+        balance_penalty = 0
+        total_trades = self.long_count + self.short_count
+        if total_trades > 10:  # Начинаем балансировать после 10 сделок
+            long_ratio = self.long_count / total_trades if total_trades > 0 else 0.5
+            # Штраф за отклонение от 50/50 (максимум -10)
+            balance_penalty = -abs(long_ratio - 0.5) * 20  # 0 to -10
 
-        # Небольшой бонус за диверсификацию действий
-        if len(self.action_history) >= 3:
-            recent_actions = self.action_history[-3:]
-            if len(set(recent_actions)) == 1 and recent_actions[0] != 0:  # Одинаковые действия (не hold)
-                reward -= 0.1  # Уменьшен штраф за повторение с 0.2 до 0.1
+        # Комбинация всех компонентов
+        reward = base_reward + trade_reward + action_diversity_reward + hold_penalty + market_comparison_reward + episode_length_penalty + balance_penalty
+        
+        # Сохраняем предыдущую цену для следующего шага
+        self.prev_price = current_price
 
-        # Clip reward to reasonable bounds (расширены для лучшего обучения)
-        reward = np.clip(reward, -20, 50)  # Расширено до [-20, 50] для учета больших бонусов
+        # Ограничить диапазон награды для стабильности
+        reward = np.clip(reward, -20, 20)
 
         return reward
 
     def step(self, action):
         """Execute one step in environment with enhanced reward function"""
         try:
-        # Check if episode should be done BEFORE executing action
-        # (but after checking if we can still access data)
-        # Note: current_step is the index we're about to process
-        if self.current_step >= len(self.df):
-            # Already beyond data - return final state
-            terminated = True
-            truncated = False
-            current_price = self.df.iloc[-1].get('close', self.df.iloc[-1].get('Close'))
-            final_portfolio = self.balance + self.margin_locked + self.position * current_price
-            portfolio_return = (final_portfolio - self.initial_balance) / self.initial_balance if self.initial_balance > 0 else 0
-            final_reward = portfolio_return * 100
-            self.portfolio_values.append(final_portfolio)
-            # Only print if debug mode is enabled
-            if self.debug:
-                print(f"Episode ended: current_step={self.current_step} >= len(df)={len(self.df)}")
-            return self._get_state(), final_reward, terminated, truncated, {
-                'portfolio_value': final_portfolio,
-                'total_return': portfolio_return,
-                'total_pnl': self.total_pnl,
-                'total_trades': self.total_trades,
-                'win_rate': self.win_count / max(1, self.total_trades) if self.total_trades > 0 else 0,
-                'sharpe_ratio': self._calculate_sharpe_ratio(),
-                'max_drawdown': self._calculate_max_drawdown()
-            }
+            # Check if episode should be done BEFORE executing action
+            # (but after checking if we can still access data)
+            # Note: current_step is the index we're about to process
+            if self.current_step >= len(self.df):
+                # Already beyond data - return final state
+                terminated = True
+                truncated = False
+                current_price = self.df.iloc[-1].get('close', self.df.iloc[-1].get('Close'))
+                final_portfolio = self.balance + self.margin_locked + self.position * current_price
+                portfolio_return = (final_portfolio - self.initial_balance) / self.initial_balance if self.initial_balance > 0 else 0
+                final_reward = portfolio_return * 100
+                self.portfolio_values.append(final_portfolio)
+                # Only print if debug mode is enabled
+                if self.debug:
+                    print(f"Episode ended: current_step={self.current_step} >= len(df)={len(self.df)}")
+                return self._get_state(), final_reward, terminated, truncated, {
+                    'portfolio_value': final_portfolio,
+                    'total_return': portfolio_return,
+                    'total_pnl': self.total_pnl,
+                    'total_trades': self.total_trades,
+                    'win_rate': self.win_count / max(1, self.total_trades) if self.total_trades > 0 else 0,
+                    'sharpe_ratio': self._calculate_sharpe_ratio(),
+                    'max_drawdown': self._calculate_max_drawdown()
+                }
 
             # Get current market data (using current_step as index)
             if self.current_step < len(self.df):
@@ -684,7 +776,9 @@ class TradingEnvironment(gym.Env):
             pnl_pct = None
 
             # Add action to history for diversity tracking
-            self.action_history.append(action)
+            # Ensure action is a plain Python int to avoid hashable type issues
+            action_int = int(action.item()) if hasattr(action, 'item') else int(action)
+            self.action_history.append(action_int)
             if len(self.action_history) > self.max_action_history:
                 self.action_history.pop(0)
 
@@ -693,6 +787,8 @@ class TradingEnvironment(gym.Env):
                 self.steps_since_last_trade += 1
             elif action == 1:  # Buy Long
                 action_performed = self._execute_buy_long(current_price, max_order_size_long, min_order_size)
+                if action_performed:
+                    self.long_count += 1  # Track long actions
             elif action == 2:  # Sell Long
                 action_performed, pnl_pct = self._execute_sell_long(current_price)
                 if action_performed:
@@ -703,6 +799,8 @@ class TradingEnvironment(gym.Env):
                             self.consecutive_losses += 1
             elif action == 3:  # Sell Short
                 action_performed = self._execute_sell_short(current_price, max_order_size_short, min_order_size)
+                if action_performed:
+                    self.short_count += 1  # Track short actions
             elif action == 4:  # Cover Short
                 action_performed, pnl_pct = self._execute_cover_short(current_price)
                 if action_performed:
@@ -732,7 +830,7 @@ class TradingEnvironment(gym.Env):
             self.steps_in_episode += 1
             
             # Add current portfolio value to history
-            self.portfolio_values.append(current_portfolio)
+            self.portfolio_history.append(current_portfolio)
 
             # Check termination conditions AFTER executing the step
             # Note: steps_in_episode was just incremented, so it's now the current step count
@@ -742,18 +840,11 @@ class TradingEnvironment(gym.Env):
             # First check: risk management conditions (stop loss / profit target)
             portfolio_return = (current_portfolio - self.initial_balance) / self.initial_balance if self.initial_balance > 0 else 0
             
-            # Check stop loss condition
-            if current_portfolio < self.initial_balance * self.termination_stop_loss_threshold:  # -30% portfolio loss
-                reward -= 10 # Penalty for early termination due to losses
-                terminated = True
-                if self.debug:
-                    print(f"Episode terminated: stop loss triggered. Portfolio={current_portfolio:.2f}, threshold={self.initial_balance * self.termination_stop_loss_threshold:.2f}")
-            # Check profit target condition
-            elif current_portfolio > self.initial_balance * self.termination_profit_target:  # +50% portfolio gain
-                reward += 20  # Bonus for reaching profit target
-                terminated = True
-                if self.debug:
-                    print(f"Episode terminated: profit target reached. Portfolio={current_portfolio:.2f}, target={self.initial_balance * self.termination_profit_target:.2f}")
+            # Check maximum episode loss condition (critical risk management)
+            # Удалены все условия раннего завершения эпизода для увеличения длины эпизодов
+            # Check profit target condition - removed to allow longer episodes
+            # Check stop loss condition - removed to allow longer episodes
+            pass
             
             # Second check: episode length limit
             if not terminated and self.steps_in_episode >= self.episode_length:
@@ -862,11 +953,11 @@ class TradingEnvironment(gym.Env):
                 'unrealized_pnl': unrealized_pnl
             }
 
-            # Debug prints only if enabled
+            # Debug prints only if enabled and limited to reduce I/O overhead
             if self.debug:
-                if self.current_step < 20:  # Debug first 20 steps
+                if self.current_step < 10:  # Only first 10 steps for debug
                     print(f"DEBUG: Step {self.current_step}, Action {action}, Performed {action_performed}, Position {self.position:.4f}, Equity {equity:.2f}, Reward {reward:.2f}")
-                elif action_performed:  # Print successful trades
+                elif action_performed and self.current_step % 50 == 0:  # Print successful trades periodically
                     pnl_str = f"{pnl_pct:.4f}" if pnl_pct is not None else "N/A"
                     print(f"TRADE: Step {self.current_step}, Action {action}, Position {self.position:.4f}, Equity {equity:.2f}, PnL% {pnl_str}")
             
