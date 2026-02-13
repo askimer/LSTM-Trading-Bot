@@ -103,8 +103,8 @@ class EnhancedTradingEnvironmentV2(gym.Env):
         # Use rolling window normalization
         price_col = 'close' if 'close' in df.columns else 'Close'
         window_size = min(100, len(df) // 10)
-        self.price_rolling_mean = df[price_col].rolling(window=window_size, min_periods=1).mean().values
-        self.price_rolling_std = df[price_col].rolling(window=window_size, min_periods=1).std().values
+        self.price_rolling_mean = df[price_col].rolling(window=window_size, min_periods=1).mean().values.copy()
+        self.price_rolling_std = df[price_col].rolling(window=window_size, min_periods=1).std().values.copy()
         self.price_rolling_std[self.price_rolling_std == 0] = 1
 
         if self.debug:

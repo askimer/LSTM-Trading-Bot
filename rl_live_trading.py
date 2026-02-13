@@ -18,18 +18,26 @@ from stable_baselines3 import PPO
 import gymnasium as gym
 from gymnasium import spaces
 
-# Import the unified trading environment
-from trading_environment import TradingEnvironment
+# Import the enhanced trading environment (same as used in training)
+from enhanced_trading_environment import EnhancedTradingEnvironment
 
 # Load environment variables
 load_dotenv()
 
-# Configure logging
+# Configure logging with UTF-8 encoding for Windows console compatibility
+import sys
+import io
+
+# Wrap stdout/stderr with UTF-8 encoding for Windows
+if sys.platform == 'win32':
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('rl_live_trading.log'),
+        logging.FileHandler('rl_live_trading.log', encoding='utf-8'),
         logging.StreamHandler()
     ]
 )
@@ -134,9 +142,15 @@ class RLLiveTradingBot:
         self.last_trade_time = 0
         self.min_trade_interval = 300  # Minimum 5 minutes between trades for real market
 
+        # Create EnhancedTradingEnvironment instance for consistent state calculation
+        # This ensures the live trading uses the exact same environment as training
+        self.live_env = None  # Will be initialized when we have market data
+        self.env_df = None  # DataFrame for environment
+
         logger.info(f"Initialized RL Live Trading Bot for {symbol}")
         logger.info(f"Test mode: {test_mode}")
         logger.info(f"Initial balance: {self.initial_balance} USDT")
+        logger.info(f"Using EnhancedTradingEnvironment for state calculation (same as training)")
 
     def init_csv_logging(self):
         """Initialize CSV logging for trade results"""
@@ -425,9 +439,183 @@ class RLLiveTradingBot:
             logger.error(f"Error calculating indicators: {e}")
             return None
 
-    def get_rl_state(self, indicators, current_price):
-        """Create state vector for RL model"""
+    def _init_live_environment(self, df):
+        """Initialize the EnhancedTradingEnvironment with market data for consistent state calculation"""
         try:
+            # Create a DataFrame with the required columns for the environment
+            env_df = df.copy()
+            
+            # Ensure we have the required columns
+            if 'close' not in env_df.columns and 'Close' in env_df.columns:
+                env_df['close'] = env_df['Close']
+            
+            # Calculate technical indicators for the environment DataFrame
+            # These are the indicators expected by EnhancedTradingEnvironment
+            close = env_df['close']
+            high = env_df['high']
+            low = env_df['low']
+            volume = env_df['volume']
+            
+            # RSI_15
+            delta = close.diff()
+            up = delta.clip(lower=0)
+            down = -1 * delta.clip(upper=0)
+            ma_up = up.rolling(window=15).mean()
+            ma_down = down.rolling(window=15).mean()
+            env_df['RSI_15'] = 100 - (100 / (1 + ma_up / ma_down))
+            
+            # Bollinger Bands 15
+            sma_15 = close.rolling(window=15).mean()
+            std_15 = close.rolling(window=15).std()
+            env_df['BB_15_upper'] = sma_15 + 2 * std_15
+            env_df['BB_15_lower'] = sma_15 - 2 * std_15
+            
+            # ATR_15
+            env_df['ATR_15'] = ta.volatility.AverageTrueRange(high, low, close, window=15).average_true_range()
+            
+            # OBV
+            env_df['OBV'] = ta.volume.OnBalanceVolumeIndicator(close, volume).on_balance_volume()
+            
+            # AD (Accumulation/Distribution)
+            env_df['AD'] = ta.volume.AccDistIndexIndicator(high, low, close, volume).acc_dist_index()
+            
+            # MFI_15
+            env_df['MFI_15'] = ta.volume.MFIIndicator(high, low, close, volume, window=15).money_flow_index()
+            
+            # Fill NaN values
+            env_df = env_df.bfill().ffill()
+            
+            # Store the DataFrame
+            self.env_df = env_df
+            
+            # Create the EnhancedTradingEnvironment
+            self.live_env = EnhancedTradingEnvironment(
+                df=env_df,
+                initial_balance=self.initial_balance,
+                transaction_fee=0.0018,
+                episode_length=len(env_df),
+                start_step=len(env_df) - 1,  # Start at the latest data point
+                debug=False,
+                enable_strategy_balancing=True
+            )
+            
+            # Sync the environment's internal state with our live trading state
+            self._sync_env_state()
+            
+            logger.info(f"Initialized EnhancedTradingEnvironment with {len(env_df)} data points")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error initializing live environment: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return False
+
+    def _sync_env_state(self):
+        """Synchronize the EnhancedTradingEnvironment's internal state with live trading state"""
+        if self.live_env is None:
+            return
+        
+        # Sync balance and position
+        self.live_env.balance = self.balance
+        self.live_env.position = self.position
+        
+        # Sync margin trading state
+        self.live_env.margin_locked = self.margin_locked
+        self.live_env.short_position_value = self.short_position * (self.short_entry_price if self.short_entry_price > 0 else 0)
+        
+        # Sync position tracking
+        self.live_env.entry_price = self.long_entry_price if self.long_position > 0 else self.short_entry_price
+        self.live_env.highest_price_since_entry = self.highest_price_since_entry
+        self.live_env.lowest_price_since_entry = self.lowest_price_since_entry
+        self.live_env.trailing_stop_loss = self.trailing_stop_loss
+        self.live_env.trailing_take_profit = self.trailing_take_profit
+        
+        # Sync portfolio tracking
+        self.live_env.total_fees = self.total_fees
+        self.live_env.prev_portfolio_value = self.balance + self.margin_locked + self.position * (self.env_df['close'].iloc[-1] if self.env_df is not None else 0)
+        
+        # Set current step to the last data point
+        if self.env_df is not None:
+            self.live_env.current_step = len(self.env_df) - 1
+
+    def _update_env_dataframe(self, new_candle):
+        """Update the environment DataFrame with new market data"""
+        if self.env_df is None:
+            return
+        
+        try:
+            # Append new candle
+            self.env_df = pd.concat([self.env_df, pd.DataFrame([new_candle])], ignore_index=True)
+            
+            # Recalculate indicators for the new row
+            close = self.env_df['close']
+            high = self.env_df['high']
+            low = self.env_df['low']
+            volume = self.env_df['volume']
+            
+            # Update RSI_15 for the last row
+            delta = close.diff()
+            up = delta.clip(lower=0)
+            down = -1 * delta.clip(upper=0)
+            ma_up = up.rolling(window=15).mean()
+            ma_down = down.rolling(window=15).mean()
+            self.env_df['RSI_15'] = 100 - (100 / (1 + ma_up / ma_down))
+            
+            # Update Bollinger Bands 15
+            sma_15 = close.rolling(window=15).mean()
+            std_15 = close.rolling(window=15).std()
+            self.env_df['BB_15_upper'] = sma_15 + 2 * std_15
+            self.env_df['BB_15_lower'] = sma_15 - 2 * std_15
+            
+            # Update ATR_15
+            self.env_df['ATR_15'] = ta.volatility.AverageTrueRange(high, low, close, window=15).average_true_range()
+            
+            # Update OBV
+            self.env_df['OBV'] = ta.volume.OnBalanceVolumeIndicator(close, volume).on_balance_volume()
+            
+            # Update AD
+            self.env_df['AD'] = ta.volume.AccDistIndexIndicator(high, low, close, volume).acc_dist_index()
+            
+            # Update MFI_15
+            self.env_df['MFI_15'] = ta.volume.MFIIndicator(high, low, close, volume, window=15).money_flow_index()
+            
+            # Fill NaN values
+            self.env_df = self.env_df.bfill().ffill()
+            
+            # Update the environment's DataFrame reference
+            self.live_env.df = self.env_df
+            self.live_env.current_step = len(self.env_df) - 1
+            
+            # Update rolling normalization values
+            window_size = min(100, len(self.env_df) // 10)
+            self.live_env.price_rolling_mean = self.env_df['close'].rolling(window=window_size, min_periods=1).mean().values.copy()
+            self.live_env.price_rolling_std = self.env_df['close'].rolling(window=window_size, min_periods=1).std().values.copy()
+            self.live_env.price_rolling_std[self.live_env.price_rolling_std == 0] = 1
+            
+        except Exception as e:
+            logger.error(f"Error updating environment DataFrame: {e}")
+
+    def get_rl_state(self, indicators, current_price):
+        """Create state vector for RL model using EnhancedTradingEnvironment's _get_state method
+        
+        This ensures the state calculation is EXACTLY the same as during training.
+        """
+        try:
+            # If the environment is initialized, use its _get_state method for consistency
+            if self.live_env is not None:
+                # Sync the environment's internal state with our live trading state
+                self._sync_env_state()
+                
+                # Get the state from the environment (same as training)
+                state = self.live_env._get_state()
+                
+                logger.debug(f"State from EnhancedTradingEnvironment: {state[:3]}...")
+                return state
+            
+            # Fallback: Manual state calculation (only if environment not initialized)
+            logger.warning("EnhancedTradingEnvironment not initialized, using fallback state calculation")
+            
             # Normalize values (same as in TradingEnvironment)
             balance_norm = self.balance / self.initial_balance - 1
             # Fix position normalization for short positions
@@ -670,7 +858,6 @@ class RLLiveTradingBot:
                     cover_amount = self.short_position
                     cost = cover_amount * current_price
                     fee = self.calculate_fee(cost)
-                    cost_with_fee = cost + fee
 
                     # Calculate PnL for short position
                     # Price PnL: we sold at entry_price, buying back at current_price
@@ -679,19 +866,26 @@ class RLLiveTradingBot:
                     # Use stored opening fee instead of recalculating
                     open_fee = self.short_opening_fees
                     close_fee = self.calculate_fee(cost)
-                    total_fee = close_fee  # Opening fee already counted
                     
-                    pnl = price_pnl - close_fee  # Opening fee already deducted from balance
+                    # Total PnL: price difference minus closing fee (opening fee already deducted)
+                    pnl = price_pnl - close_fee
 
-                    # Check sufficient margin to cover the position
-                    if self.balance >= cost_with_fee:  # Check if we have enough to cover
+                    # Check sufficient balance to buy back the BTC
+                    # We need: cost (to buy BTC) + close_fee
+                    # We have: balance + margin_locked (which will be returned)
+                    net_cash_needed = cost + close_fee - self.margin_locked
+                    
+                    if self.balance >= net_cash_needed:
                         # Update short position
                         self.short_position = 0
 
-                        # Return margin + PnL (opening fee was already deducted when opening)
-                        self.balance += self.margin_locked + pnl
+                        # Correct balance calculation:
+                        # 1. Deduct cost of buying back BTC
+                        # 2. Return margin_locked
+                        # 3. Price PnL is already accounted for in the cost vs proceeds
+                        self.balance = self.balance - cost - close_fee + self.margin_locked
                         self.margin_locked = 0
-                        self.total_fees += close_fee # Only count closing fee here
+                        self.total_fees += close_fee  # Only count closing fee here
                         self.short_opening_fees = 0.0  # Reset
 
                         # Update overall position
@@ -710,7 +904,7 @@ class RLLiveTradingBot:
                             'type': 'BUY_SHORT',
                             'price': current_price,
                             'amount': cover_amount,
-                            'value': cost_with_fee,
+                            'value': cost,
                             'fee': fee,
                             'pnl': pnl,
                             'cumulative_pnl': self.cumulative_pnl,
@@ -724,10 +918,10 @@ class RLLiveTradingBot:
                         self.log_trade_to_csv(trade)
                         trade_executed = True
 
-                        logger.info(f"VIRTUAL BUY SHORT: {cover_amount:.6f} BTC at ${current_price:.2f}, Trade PnL: ${pnl:.2f}, Cumulative P&L: ${self.cumulative_pnl:.2f}, Margin Unlocked: ${self.margin_locked:.2f}")
+                        logger.info(f"VIRTUAL BUY SHORT: {cover_amount:.6f} BTC at ${current_price:.2f}, Trade PnL: ${pnl:.2f}, Cumulative P&L: ${self.cumulative_pnl:.2f}")
                         self.last_trade_time = current_time
                     else:
-                        logger.warning(f"Insufficient funds to cover short position. Need: ${cost_with_fee:.2f}, Have: ${self.balance:.2f}")
+                        logger.warning(f"Insufficient funds to cover short position. Need: ${net_cash_needed:.2f}, Have: ${self.balance:.2f}")
                         return False
 
             return trade_executed
@@ -849,6 +1043,13 @@ class RLLiveTradingBot:
             logger.error("Failed to initialize market data buffer")
             return
 
+        # Initialize the EnhancedTradingEnvironment with market data
+        print("Initializing EnhancedTradingEnvironment for consistent state calculation...")
+        if not self._init_live_environment(self.market_data_buffer):
+            logger.error("Failed to initialize EnhancedTradingEnvironment")
+            return
+        print("✅ EnhancedTradingEnvironment initialized successfully")
+
         # Try Binance WebSocket first (public endpoint)
         try:
             import urllib.request
@@ -919,12 +1120,16 @@ class RLLiveTradingBot:
                 pd.DataFrame([new_candle])
             ]).tail(350)
 
+            # Update the EnhancedTradingEnvironment DataFrame with new data
+            if self.live_env is not None:
+                self._update_env_dataframe(new_candle)
+
             # Calculate indicators with updated data
             indicators = self.calculate_indicators(self.market_data_buffer)
             if indicators is None:
                 return
 
-            # Create RL state
+            # Create RL state using EnhancedTradingEnvironment
             state = self.get_rl_state(indicators, current_price)
 
             # Get action from RL model
@@ -995,6 +1200,13 @@ class RLLiveTradingBot:
             logger.error("Failed to initialize market data buffer")
             return
 
+        # Initialize the EnhancedTradingEnvironment with market data
+        print("Initializing EnhancedTradingEnvironment for consistent state calculation...")
+        if not self._init_live_environment(self.market_data_buffer):
+            logger.error("Failed to initialize EnhancedTradingEnvironment")
+            return
+        print("✅ EnhancedTradingEnvironment initialized successfully")
+
         session_start = time.time()
 
         while datetime.now() < end_time:
@@ -1010,6 +1222,19 @@ class RLLiveTradingBot:
                 self.market_data_buffer = pd.concat([self.market_data_buffer, df]).drop_duplicates(subset=['timestamp']).tail(350)
 
                 current_price = df['close'].iloc[-1]
+
+                # Update the EnhancedTradingEnvironment DataFrame with new data
+                if self.live_env is not None and len(df) > 0:
+                    # Update environment with the latest candle
+                    new_candle = {
+                        'timestamp': df['timestamp'].iloc[-1],
+                        'open': df['open'].iloc[-1],
+                        'high': df['high'].iloc[-1],
+                        'low': df['low'].iloc[-1],
+                        'close': current_price,
+                        'volume': df['volume'].iloc[-1]
+                    }
+                    self._update_env_dataframe(new_candle)
 
                 # Calculate indicators
                 indicators = self.calculate_indicators(self.market_data_buffer)

@@ -80,21 +80,21 @@ download_and_process_data(start_date, end_date)
     with open('temp_get_data.py', 'w') as f:
         f.write(temp_script)
 
-    success, output = run_command("python temp_get_data.py", f"Скачивание данных за последние {data_days} дней")
+    success, output = run_command(f'"{sys.executable}" temp_get_data.py', f"Скачивание данных за последние {data_days} дней")
     os.remove('temp_get_data.py')
     return success
 
 def clean_data():
     """Шаг 2: Очистка данных"""
-    return run_command("python clean_data.py", "Очистка данных (удаление NaN, ненужных колонок)")[0]
+    return run_command(f'"{sys.executable}" clean_data.py', "Очистка данных (удаление NaN, ненужных колонок)")[0]
 
 def feature_engineer():
     """Шаг 3: Feature engineering"""
-    return run_command("python feature_engineer.py", "Добавление технических индикаторов")[0]
+    return run_command(f'"{sys.executable}" feature_engineer.py', "Добавление технических индикаторов")[0]
 
 def train_rl(timesteps=100000):
     """Шаг 4: Обучение RL модели"""
-    command = f"python3 train_rl_balanced.py --timesteps {timesteps}"
+    command = f'"{sys.executable}" train_rl_balanced.py --timesteps {timesteps}'
     return run_command(command, f"Обучение RL агента с балансировкой стратегии ({timesteps} шагов)")[0]
 
 def evaluate_model():
@@ -150,7 +150,7 @@ def optimize_hyperparameters(n_trials=30):
     print(f"\n⚙️ Оптимизация гиперпараметров ({n_trials} проб)")
     print("=" * 50)
     
-    command = f"python hyperparameter_optimization.py --n_trials {n_trials}"
+    command = f'"{sys.executable}" hyperparameter_optimization.py --n_trials {n_trials}'
     success, output = run_command(command, f"Оптимизация гиперпараметров ({n_trials} проб)")
     
     if success:
@@ -264,7 +264,7 @@ def iterative_training_pipeline(data_days=365, initial_timesteps=100000, max_ite
 
 def main():
     parser = argparse.ArgumentParser(description='RL Trading Pipeline с автоматической оптимизацией')
-    parser.add_argument('--data-days', type=int, default=365,
+    parser.add_argument('--data-days', type=int, default=720,
                        help='Количество дней данных для скачивания (по умолчанию 365)')
     parser.add_argument('--timesteps', type=int, default=100000,
                        help='Количество шагов тренировки RL (по умолчанию 100000)')

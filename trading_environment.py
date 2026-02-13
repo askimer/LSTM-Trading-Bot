@@ -84,8 +84,8 @@ class TradingEnvironment(gym.Env):
         price_col = 'close' if 'close' in df.columns else 'Close'
         # Calculate rolling mean and std for better stationarity
         window_size = min(100, len(df) // 10)  # 10% of data or 100, whichever is smaller
-        self.price_rolling_mean = df[price_col].rolling(window=window_size, min_periods=1).mean().values
-        self.price_rolling_std = df[price_col].rolling(window=window_size, min_periods=1).std().values
+        self.price_rolling_mean = df[price_col].rolling(window=window_size, min_periods=1).mean().values.copy()
+        self.price_rolling_std = df[price_col].rolling(window=window_size, min_periods=1).std().values.copy()
         self.price_rolling_std[self.price_rolling_std == 0] = 1  # Avoid division by zero
 
         if self.debug:

@@ -50,3 +50,6 @@ ccxt>=4.3.90
 python-dotenv>=1.0.1
 optuna>=3.6.1
 seaborn
+websocket-client>=1.8.0
+torch  # PyTorch
+stable_baselines3
