@@ -44,12 +44,12 @@ url-normalize>=2.2.0
 urllib3>=2.4.0
 gymnasium>=0.29.1
 tensorboard>=2.16.2
-TA-lib
-ta
+TA-lib>=0.4.28
+ta>=0.10.0
 ccxt>=4.3.90
 python-dotenv>=1.0.1
 optuna>=3.6.1
 seaborn
 websocket-client>=1.8.0
-torch  # PyTorch
-stable_baselines3
+torch>=2.0.0,<=2.2.2
+stable-baselines3

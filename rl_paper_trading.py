@@ -16,7 +16,7 @@ import time
 from datetime import datetime
 
 # Import the unified TradingEnvironment
-from trading_environment import TradingEnvironment
+from enhanced_trading_environment import EnhancedTradingEnvironment as TradingEnvironment
 
 def calculate_sharpe_ratio(returns, risk_free_rate=0.000006811):
     """Calculate Sharpe ratio"""
@@ -64,6 +64,10 @@ def run_rl_paper_trading(model_path, data_path, initial_balance=10000, n_episode
     except Exception as e:
         print(f"❌ Error loading data: {e}")
         return None
+
+    # Support both 'close' and 'Close' column names
+    if 'close' not in df.columns and 'Close' in df.columns:
+        df['close'] = df['Close']
 
     # Check required columns
     required_columns = ['close', 'ATR_15', 'RSI_15', 'BB_15_upper', 'BB_15_lower', 'OBV', 'AD', 'MFI_15']
@@ -158,6 +162,7 @@ def run_rl_paper_trading(model_path, data_path, initial_balance=10000, n_episode
 def _correct_action(action, env_position, env):
     """
     Correct action based on current position to prevent invalid trades
+    NOTE: Only correct truly invalid actions, let the environment handle the rest
     """
     original_action = action
     
@@ -169,13 +174,8 @@ def _correct_action(action, env_position, env):
     if action == 4 and env_position >= 0:
         return 0  # Hold
     
-    # If trying to buy long when already have a large position, hold instead
-    if action == 1 and env_position > 0.01:  # Arbitrary limit
-        return 0  # Hold
-    
-    # If trying to sell short when already have a large short position, hold instead
-    if action == 3 and env_position < -0.01:  # Arbitrary limit
-        return 0  # Hold
+    # NOTE: Removed blocking of repeated buys/shorts - let environment handle position limits
+    # The environment has its own position size limits
     
     # Allow actions that are valid for the current position
     return action
@@ -202,7 +202,9 @@ def _run_single_episode(env, model, initial_balance, df, episode_number=1, verbo
         current_price = df.iloc[min(env.current_step, len(df)-1)].get('close', df.iloc[min(env.current_step, len(df)-1)].get('Close'))
 
         # Get action from RL model
-        action, _ = model.predict(state, deterministic=True)
+        # Use stochastic sampling to allow exploration of all actions
+        # Deterministic mode always picks the highest probability action (biased to SELL_SHORT)
+        action, _ = model.predict(state, deterministic=False)
         action = int(action)  # Ensure action is integer
         
         # Validate action is within bounds
@@ -325,8 +327,8 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="RL Paper Trading Simulation")
-    parser.add_argument("--model", default="ppo_trading_agent.zip",
-                       help="Path to trained RL model")
+    parser.add_argument("--model", default="ppo_trading_agent",
+                       help="Path to trained RL model (without .zip extension)")
     parser.add_argument("--data", default="btc_usdt_training_data/full_btc_usdt_data_feature_engineered.csv",
                        help="Path to historical data")
     parser.add_argument("--balance", type=float, default=10000,

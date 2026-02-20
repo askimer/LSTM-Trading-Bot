@@ -33,7 +33,8 @@ def calculate_macd(data, window_slow=26, window_fast=12, signal=9):
     ema_slow = calculate_ema(data, window_slow)
     macd = ema_fast - ema_slow
     signal_line = macd.rolling(window=signal).mean()
-    return macd, signal_line
+    histogram = macd - signal_line
+    return macd, signal_line, histogram
 
 def calculate_OBV(data):
     close = data['Close']
@@ -154,9 +155,10 @@ def process_chunk(chunk, overlap, indicators, window_size):
             chunk_combined[f'{indicator_name}_upper'] = upper
             chunk_combined[f'{indicator_name}_lower'] = lower
         elif indicator_name.startswith('MACD_'):
-            macd, signal = indicator_func(chunk_combined, *params)
+            macd, signal, histogram = indicator_func(chunk_combined, *params)
             chunk_combined[f'{indicator_name}_macd'] = macd
             chunk_combined[f'{indicator_name}_signal'] = signal
+            chunk_combined[f'{indicator_name}_histogram'] = histogram
         elif indicator_name == 'OBV':
             chunk_combined[indicator_name] = indicator_func(chunk_combined)
         elif indicator_name.startswith('ATR_') or indicator_name.startswith('ADX_'):
@@ -196,6 +198,12 @@ indicators = {
     'RSI_60': (calculate_rsi, (TimeWindows.short.value)),
     'RSI_300': (calculate_rsi, (TimeWindows.long.value)),
     'ULTOSC': (calculate_ULTOSC, ()),
+
+    # Trend Indicators - MACD for trend confirmation
+    'MACD_default': (calculate_macd, (26, 12, 9)),
+
+    # Stochastic Oscillator for overbought/oversold
+    'Stochastic': (calculate_stochastic, ()),
 
     # Volume Indicators
     'OBV': (calculate_OBV, ()),

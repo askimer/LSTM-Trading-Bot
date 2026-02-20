@@ -100,6 +100,10 @@ rl_logs/
 .vscode/
 .idea/
 
+# Custom
+.kilocode/
+TRASH/
+
 # Trading specific sensitive files
 api_keys.json
 keys.json

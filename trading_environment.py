@@ -667,68 +667,99 @@ class TradingEnvironment(gym.Env):
 
     def _calculate_reward(self, current_price, action, action_performed=False, pnl_pct=None):
         """
-        Улучшенная система наград для стимулирования прибыльной торговли
+        Ultra-selective reward function - reward PATIENCE and QUALITY
+        
+        Key principle: Most trades should be HOLD, only trade when confident
+        - Heavy penalty for unprofitable trades
+        - Reward for HOLD when market is uncertain
+        - Strong reward only for HIGH CONFIDENCE profitable trades
         """
         # Calculate current equity (portfolio value)
         current_portfolio = self.balance + self.margin_locked + self.position * current_price
-
-        # Базовая награда: изменение портфеля
-        if self.prev_portfolio_value > 0:
-            portfolio_return = (current_portfolio - self.prev_portfolio_value) / self.prev_portfolio_value
-            base_reward = portfolio_return * 100  # Увеличен масштаб для лучшей чувствительности
-        else:
-            base_reward = 0.0
-
-        # Награда за прибыльность сделки (если была выполнена)
-        trade_reward = 0
-        if action_performed and pnl_pct is not None:
-            if pnl_pct > 0:
-                trade_reward = pnl_pct * 100  # Поощрение за положительную прибыль
-            else:
-                trade_reward = pnl_pct * 50   # Меньший штраф за убыток
-
-        # Награда за разнообразие действий
-        action_diversity_reward = 0
-        if len(self.action_history) >= 2:
-            unique_actions = len(set(self.action_history))
-            if unique_actions >= 3:  # Разнообразие действий
-                action_diversity_reward = 0.1
-
-        # Штраф за избыточные холды (слишком много бездействия)
-        hold_penalty = 0
-        if action == 0:  # Hold action
-            if self.steps_since_last_trade > 5:  # Если долго не было сделок
-                hold_penalty = -0.05
-
-        # Награда за стабильность (по сравнению с рынком)
-        market_comparison_reward = 0
-        if hasattr(self, 'prev_price') and self.prev_price > 0:
-            market_return = (current_price - self.prev_price) / self.prev_price
-            excess_return = portfolio_return - market_return
-            if excess_return > 0.001:  # Превышение рынка на 0.1%
-                market_comparison_reward = excess_return * 50
-
-        # Пенальти за слишком короткие эпизоды
-        episode_length_penalty = 0
-        if self.steps_in_episode < self.min_episode_length_for_rewards:
-            missing_steps = self.min_episode_length_for_rewards - self.steps_in_episode
-            episode_length_penalty = -missing_steps * 0.2  # Увеличенный штраф
-
-        # Балансировка лонг/шорт - штраф за дисбаланс направлений
-        balance_penalty = 0
-        total_trades = self.long_count + self.short_count
-        if total_trades > 10:  # Начинаем балансировать после 10 сделок
-            long_ratio = self.long_count / total_trades if total_trades > 0 else 0.5
-            # Штраф за отклонение от 50/50 (максимум -10)
-            balance_penalty = -abs(long_ratio - 0.5) * 20  # 0 to -10
-
-        # Комбинация всех компонентов
-        reward = base_reward + trade_reward + action_diversity_reward + hold_penalty + market_comparison_reward + episode_length_penalty + balance_penalty
         
-        # Сохраняем предыдущую цену для следующего шага
+        # Track trade outcomes
+        if not hasattr(self, 'trade_outcomes'):
+            self.trade_outcomes = []
+            self.peak_portfolio = current_portfolio
+            self.steps_without_trade = 0
+        
+        # Update peak
+        if current_portfolio > self.peak_portfolio:
+            self.peak_portfolio = current_portfolio
+        
+        # === 1. HOLD REWARD: Reward patience ===
+        hold_reward = 0
+        if action == 0:  # HOLD
+            self.steps_without_trade += 1
+            # Small reward for patience (avoiding bad trades)
+            if self.steps_without_trade > 5:
+                hold_reward = 0.02  # Small but consistent reward for waiting
+        else:
+            self.steps_without_trade = 0
+        
+        # === 2. TRADE QUALITY REWARD ===
+        trade_reward = 0
+        if action in [2, 4] and pnl_pct is not None:  # Closing positions
+            if pnl_pct > 0.002:  # Profit > 0.2%
+                # EXCELLENT trade - strong reward
+                trade_reward = pnl_pct * 500  # 5x multiplier for good profits
+                self.trade_outcomes.append(('excellent', pnl_pct))
+            elif pnl_pct > 0:
+                # OK trade - moderate reward
+                trade_reward = pnl_pct * 200
+                self.trade_outcomes.append(('ok', pnl_pct))
+            elif pnl_pct > -0.002:
+                # Small loss - small penalty
+                trade_reward = pnl_pct * 150
+                self.trade_outcomes.append(('small_loss', pnl_pct))
+            else:
+                # BAD trade - heavy penalty
+                trade_reward = pnl_pct * 300  # 3x penalty for big losses
+                self.trade_outcomes.append(('bad', pnl_pct))
+            
+            # Keep only recent trades
+            if len(self.trade_outcomes) > 30:
+                self.trade_outcomes.pop(0)
+        
+        # === 3. WIN RATE BONUS/PENALTY ===
+        win_rate_reward = 0
+        if len(self.trade_outcomes) >= 5:
+            wins = sum(1 for t in self.trade_outcomes if t[0] in ['excellent', 'ok'])
+            win_rate = wins / len(self.trade_outcomes)
+            
+            if win_rate >= 0.7:
+                win_rate_reward = 2.0  # Big bonus for high win rate
+            elif win_rate >= 0.5:
+                win_rate_reward = 0.5  # Small bonus for decent win rate
+            elif win_rate < 0.3:
+                win_rate_reward = -2.0  # Heavy penalty for low win rate
+        
+        # === 4. DRAWDOWN PENALTY ===
+        drawdown_penalty = 0
+        if self.peak_portfolio > 0:
+            drawdown = (self.peak_portfolio - current_portfolio) / self.peak_portfolio
+            if drawdown > 0.01:
+                drawdown_penalty = -drawdown * 30
+        
+        # === 5. PORTFOLIO GROWTH ===
+        growth_reward = 0
+        if current_portfolio > self.initial_balance:
+            growth = (current_portfolio - self.initial_balance) / self.initial_balance
+            growth_reward = growth * 30
+        
+        # === COMBINE ===
+        reward = (
+            hold_reward +          # Reward patience
+            trade_reward +         # Trade quality
+            win_rate_reward +      # Win rate bonus/penalty
+            drawdown_penalty +     # Drawdown penalty
+            growth_reward          # Overall growth
+        )
+        
+        # Store for next iteration
         self.prev_price = current_price
 
-        # Ограничить диапазон награды для стабильности
+        # Clip
         reward = np.clip(reward, -20, 20)
 
         return reward

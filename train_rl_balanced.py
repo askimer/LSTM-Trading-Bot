@@ -12,7 +12,7 @@ from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv
 from stable_baselines3.common.callbacks import BaseCallback, EvalCallback, CheckpointCallback
 from stable_baselines3.common.monitor import Monitor
-from stable_baselines3.common.vec_env import SubprocVecEnv
+from stable_baselines3.common.vec_env import SubprocVecEnv, VecNormalize
 from stable_baselines3.common.utils import get_linear_fn
 import pickle
 import torch
@@ -595,7 +595,10 @@ def train_rl_agent(data_path, total_timesteps=200000, eval_freq=10000, n_envs=8,
     if df.empty:
         raise ValueError(f"No data found in {data_path}")
 
-    # Check for required columns
+    # Check for required columns (support both 'close' and 'Close')
+    if 'close' not in df.columns and 'Close' in df.columns:
+        df['close'] = df['Close']
+    
     required_columns = ['close', 'ATR_15', 'RSI_15', 'BB_15_upper', 'BB_15_lower', 'OBV', 'AD', 'MFI_15']
     missing_columns = [col for col in required_columns if col not in df.columns and f'{col}_15' not in df.columns]
     if missing_columns:
@@ -638,33 +641,54 @@ def train_rl_agent(data_path, total_timesteps=200000, eval_freq=10000, n_envs=8,
     print(f"Creating {n_envs} parallel RL environments...")
     # Create parallel environments using SubprocVecEnv (debug=False for performance)
     envs = [make_env(df, i, debug=False) for i in range(n_envs)]
-    env = SubprocVecEnv(envs)
+    raw_env = SubprocVecEnv(envs)
+
+    # FIX v4: norm_obs=False — _get_state() уже выполняет ручную нормализацию всех признаков.
+    # Двойная нормализация (VecNormalize поверх ручной) уничтожает сигналы о позиции:
+    #   - position_norm (0 большинство времени) → running_std → 0 → сигнал взрывается/схлопывается
+    #   - can_close, steps_to_close_norm (бинарные) → бегущая статистика нестабильна в начале обучения
+    # Итог двойной нормализации: модель не может надёжно определить наличие открытой позиции
+    #   и поэтому спамит BUY_LONG вместо SELL_LONG.
+    # norm_reward=True сохраняем: нормализация наград предотвращает взрыв градиентов.
+    # clip_reward=50.0 (было 10.0): не обрезать крупные PnL сигналы при закрытии позиций.
+    env = VecNormalize(
+        raw_env,
+        norm_obs=False,   # ИСПРАВЛЕНО: отключить! _get_state() уже нормализует наблюдения
+        norm_reward=True,
+        clip_obs=10.0,
+        clip_reward=50.0,  # Увеличено: не обрезать крупные PnL-сигналы при закрытии
+        gamma=0.99,
+    )
+    print("✅ VecNormalize applied: norm_obs=False (ручная норм. в _get_state), norm_reward=True")
 
     print("Creating PPO model...")
-    # Оптимизированные параметры PPO для сбалансированной торговли
-    # Key changes for balanced trading:
-    # - Higher ent_coef (0.1) to encourage exploration of all actions
-    # - Lower learning rate for stability
-    # - Action masking via reward shaping in environment
+    # FIX v3: Profit-optimized PPO parameters
+    # Key changes for profitable trading:
+    # - learning_rate: 3e-5 → 1e-5 (more stable convergence)
+    # - ent_coef: 0.05 → 0.1 (more exploration for profit opportunities)
+    # - clip_range: 0.1 → 0.15 (slightly larger updates)
+    # - batch_size: 256 → 512 (better gradient estimation)
+    # - n_epochs: 5 → 8 (more training per batch)
+    # - max_grad_norm: 0.5 → 0.3 (stronger gradient clipping)
     model = PPO(
         "MlpPolicy",
         env,
-        learning_rate=3e-5,  # Уменьшен для стабильности (было 5e-5)
-        n_steps=1024,  # Уменьшено для более частых обновлений (было 2048)
-        batch_size=64,  # Уменьшено для стабильности (было 128)
-        n_epochs=10,  # Увеличено для лучшего обучения (было 5)
-        gamma=0.95,  # Уменьшено для более краткосрочной ориентации (было 0.99)
-        gae_lambda=0.90,  # Уменьшено для менее смещенной оценки (было 0.95)
-        clip_range=0.2,  # Увеличено для более агрессивных обновлений (было 0.1)
-        ent_coef=0.10,  # УВЕЛИЧЕНО для поощрения исследования всех действий (было 0.05)
-        vf_coef=0.25,  # Уменьшено для баланса с policy (было 0.5)
-        max_grad_norm=0.3,  # Уменьшено для лучшей стабильности (было 0.5)
-        verbose=0,  # Отключаем вывод stable_baselines3
+        learning_rate=1e-5,        # Reduced for stable profit learning
+        n_steps=2048,
+        batch_size=512,            # Larger batch for better gradient estimation
+        n_epochs=8,                # More epochs per update
+        gamma=0.99,
+        gae_lambda=0.95,
+        clip_range=0.15,           # Slightly larger for profit exploration
+        ent_coef=0.1,              # Higher entropy for profit opportunity exploration
+        vf_coef=0.5,
+        max_grad_norm=0.3,         # Stronger gradient clipping to prevent NaN
+        verbose=0,
         tensorboard_log="./rl_tensorboard/",
         policy_kwargs=dict(
-            net_arch=dict(pi=[128, 64], vf=[128, 64]),  # Уменьшенная архитектура для стабильности
-            activation_fn=torch.nn.ReLU,  # Используем ReLU вместо Tanh
-            ortho_init=True,  # Ортогональная инициализация
+            net_arch=dict(pi=[256, 128], vf=[256, 128]),
+            activation_fn=torch.nn.Tanh,  # Tanh stable with VecNormalize
+            ortho_init=True,
         )
     )
 
@@ -822,6 +846,19 @@ def train_rl_agent(data_path, total_timesteps=200000, eval_freq=10000, n_envs=8,
     # Use SubprocVecEnv for evaluation to match training env type and avoid warnings
     # Using single process for eval is fine - it matches the type requirement
     eval_env = SubprocVecEnv([make_eval_env])
+    
+    # Wrap eval_env in VecNormalize to match training env structure
+    # This fixes the AssertionError in sync_envs_normalization
+    eval_env = VecNormalize(
+        eval_env,
+        norm_obs=False,  # Same as training env - manual normalization in _get_state
+        norm_reward=True,  # Same as training env
+        clip_reward=50.0,  # Same as training env
+        gamma=0.99,
+        epsilon=1e-8,
+        clip_obs=10.0
+    )
+    print("✅ VecNormalize applied to eval_env: norm_obs=False, norm_reward=True")
     
     # Adjust eval frequency based on total timesteps
     # For longer training, evaluate less frequently to avoid slowdowns
@@ -1048,7 +1085,7 @@ def evaluate_agent_comprehensive(model, data_path, n_episodes=10):
         start_idx = np.random.randint(0, max(1, len(df) - eval_length))
         eval_df = df.iloc[start_idx:start_idx + eval_length].reset_index(drop=True)
 
-        env = TradingEnvironment(eval_df)
+        env = EnhancedTradingEnvironment(eval_df)  # CRITICAL: Use same environment as training
         obs, _ = env.reset()
         done = False
         portfolio_history = [env.initial_balance]

@@ -1,262 +1,247 @@
-# RL Algorithmic Trading Bot
+осмотри# RL Algorithmic Trading Bot
 
-A sophisticated reinforcement learning-based algorithmic trading system that uses Deep Q-Network (DQN) and Proximal Policy Optimization (PPO) algorithms to trade cryptocurrency markets.
+Продвинутая система алгоритмической торговли на основе обучения с подкреплением (Reinforcement Learning). Использует алгоритм PPO (Proximal Policy Optimization) для торговли криптовалютными парами с поддержкой как лонг, так и шорт позиций.
 
-## 🚀 Features
+## 🚀 Возможности
 
-- **Advanced RL Algorithms**: Implements both DQN and PPO for optimal trading strategies
-- **Multi-Asset Support**: Capable of trading various cryptocurrency pairs
-- **Comprehensive Risk Management**: Built-in stop-loss, take-profit, position sizing, and portfolio controls
-- **Real-time Trading**: Supports live trading with virtual/paper trading modes
-- **Advanced Technical Analysis**: Incorporates 30+ technical indicators for decision making
-- **Hyperparameter Optimization**: Automated optimization using Optuna
-- **Performance Analytics**: Comprehensive backtesting and live performance metrics
-- **Reproducible Results**: Fixed random seeds for consistent training outcomes
+- **Алгоритм PPO**: Продвинутый алгоритм обучения с подкреплением от Stable-Baselines3
+- **Лонг и Шорт позиции**: Полная поддержка маржинальной торговли с короткими позициями
+- **Балансировка стратегий**: Автоматический баланс между лонг и шорт сделками
+- **Продвинутый риск-менеджмент**: Stop-loss, take-profit, trailing stops, контроль просадки
+- **30+ технических индикаторов**: RSI, MACD, Bollinger Bands, ATR, Stochastic и другие
+- **Параллельное обучение**: Поддержка множества параллельных сред для ускорения обучения
+- **TensorBoard**: Детальная визуализация процесса обучения
+- **Paper Trading**: Симуляция торговли на исторических данных
+- **Live Trading**: Интеграция с реальными биржами через CCXT
 
-## 📊 Trading Strategies
+## 📊 Торговые стратегии
 
-The system implements multiple trading strategies:
+Система поддерживает различные торговые подходы:
 
-1. **Trend Following**: Identifies and follows market trends
-2. **Mean Reversion**: Capitalizes on price deviations from mean
-3. **Breakout Trading**: Exploits price breakouts from consolidation patterns
-4. **Momentum Trading**: Captures momentum-driven price movements
+1. **Trend Following**: Следование за трендом на основе MACD и EMA
+2. **Mean Reversion**: Торговля на возврате к среднему (RSI, Bollinger Bands)
+3. **Breakout Trading**: Торговля на пробоях уровней
+4. **Momentum Trading**: Торговля на импульсе цены
 
-## 🏗️ Architecture
+## 🏗️ Архитектура проекта
 
 ```
-rl-trading-bot/
-├── trading_environment.py      # Unified trading environment
-├── train_rl.py                # RL training module with reproducible seeds
-├── rl_paper_trading.py        # Paper trading simulation
-├── rl_live_trading.py         # Live trading module with improved error handling
-├── risk_management.py         # Advanced risk controls
-├── hyperparameter_optimization.py  # Hyperparameter tuning with logging
-├── data/
-│   ├── btc_usdt_data/         # Historical market data
-│   └── feature_engineered/    # Engineered features
-├── models/                    # Trained RL models
-├── notebooks/                 # Jupyter notebooks for analysis
-└── utils/                     # Utility functions
+RL-Algorithmic-Trading-Bot/
+├── 📈 Торговые среды (Gymnasium)
+│   ├── trading_environment.py           # Базовая торговая среда
+│   └── enhanced_trading_environment.py  # Расширенная среда с балансировкой стратегий
+│
+├── 🤖 Обучение и оценка
+│   ├── train_rl_balanced.py             # Обучение PPO-агента
+│   ├── eval_model.py                    # Оценка модели
+│   ├── rl_paper_trading.py              # Paper trading (симуляция)
+│   └── rl_live_trading.py               # Live trading (реальная торговля)
+│
+├── 🛡️ Управление рисками
+│   └── risk_management.py               # Продвинутая система риск-менеджмента
+│
+├── 📊 Данные и признаки
+│   ├── feature_engineer.py              # Генерация технических индикаторов
+│   ├── get_price_data.py                # Получение данных с бирж
+│   └── btc_usdt_training_data/          # Исторические данные
+│
+├── ⚙️ Конфигурация
+│   ├── config.py                        # Пути к данным и моделям
+│   └── pyproject.toml                   # Зависимости (UV)
+│
+└── 📁 Результаты
+    ├── rl_models/                       # Обученные модели
+    ├── rl_logs/                         # Логи обучения
+    ├── rl_tensorboard/                  # TensorBoard логи
+    └── rl_checkpoints/                  # Чекпоинты
 ```
 
-## 📈 Technical Indicators
+## 🎯 Пространство действий (5 действий)
 
-The system incorporates 30+ technical indicators:
+| Действие | Описание |
+|----------|----------|
+| `0` | Hold — Удерживать позицию |
+| `1` | Buy Long — Открыть лонг позицию |
+| `2` | Sell Long — Закрыть лонг позицию |
+| `3` | Sell Short — Открыть шорт позицию |
+| `4` | Cover Short — Закрыть шорт позицию |
 
-- **Trend Indicators**: Moving Averages (EMA, WMA), MACD, ADX
-- **Momentum Indicators**: RSI, Stochastic Oscillator, ROC, Williams %R
-- **Volatility Indicators**: Bollinger Bands, ATR, Keltner Channels
-- **Volume Indicators**: OBV, AD, MFI, VPT
-- **Pattern Recognition**: Candlestick patterns, support/resistance levels
+## 📈 Пространство состояний (18 признаков)
 
-## 🎯 RL Implementation
+| Признак | Описание |
+|---------|----------|
+| `balance_norm` | Нормализованный баланс |
+| `position_norm` | Нормализованная позиция (знак = направление) |
+| `price_norm` | Нормализованная цена |
+| `can_close` | Можно ли закрыть позицию (прошло min_hold_steps) |
+| `steps_to_close_norm` | Обратный отсчёт до разрешения закрытия |
+| `unrealized_pnl` | Нереализованная прибыль/убыток |
+| `12 индикаторов` | RSI, BB_upper, BB_lower, ATR, trends, MFI, MACD, Stochastic |
 
-### DQN (Deep Q-Network)
-- Deep neural network with experience replay
-- Double DQN with Dueling architecture
-- Prioritized Experience Replay for efficient learning
+## 🛡️ Риск-менеджмент
 
-### PPO (Proximal Policy Optimization)
-- Actor-Critic architecture with shared feature extractor
-- Clipped surrogate objective for stable training
-- Adaptive learning rate scheduling
+### Параметры риска
+- **Max позиция**: 10% от капитала на одну сделку
+- **Max экспозиция**: 40% от капитала всего
+- **Stop-loss**: 8% (адаптивный на основе ATR)
+- **Take-profit**: 15%
+- **Max просадка**: 20%
+- **Trailing stop**: 5% от пика прибыли
 
-## 🛡️ Risk Management
+### Метрики риска
+- Value at Risk (VaR)
+- Conditional VaR (CVaR)
+- Sharpe Ratio
+- Sortino Ratio
+- Max Drawdown
 
-Comprehensive risk controls:
+## 🚀 Быстрый старт
 
-- **Position Sizing**: Dynamic position sizing based on volatility and risk tolerance
-- **Stop Loss**: Trailing stop-loss with adaptive distances
-- **Take Profit**: Dynamic take-profit levels
-- **Correlation Limits**: Maximum correlation between positions
-- **Exposure Limits**: Individual and total portfolio exposure caps
-- **Drawdown Control**: Automatic trading halt on excessive drawdown
-- **Volatility Limits**: Position reduction during high volatility periods
-
-## 📊 Performance Metrics
-
-The system tracks multiple performance metrics:
-
-- **Return Metrics**: Total return, annualized return, cumulative return
-- **Risk-Adjusted Metrics**: Sharpe ratio, Sortino ratio, Calmar ratio
-- **Risk Metrics**: Value at Risk (VaR), Expected Shortfall (ES), Maximum drawdown
-- **Efficiency Metrics**: Profit factor, Win rate, Average trade duration
-- **Correlation Metrics**: Beta, Alpha, Information ratio
-
-## 🚀 Getting Started
-
-### Prerequisites
+### Требования
 
 - Python 3.11+
-- UV package manager (recommended)
+- UV package manager (рекомендуется)
+- GPU опционально (ускоряет обучение)
 
-### Installation
+### Установка
 
 ```bash
-# Clone the repository
-git clone https://github.com/yourusername/rl-trading-bot.git
-cd rl-trading-bot
+# Клонирование репозитория
+git clone https://github.com/askimer/LSTM-Trading-Bot.git
+cd RL-Algorithmic-Trading-Bot
 
-# Install dependencies using UV (recommended)
+# Установка зависимостей через UV
 uv sync
 
-# Or if UV is not available, use pip
+# Или через pip
 pip install -r requirements.txt
-
-# Install PyTorch and Stable-Baselines3 separately based on your platform:
-# For Linux/macOS with CPU:
-pip install torch torchvision torchaudio
-pip install stable-baselines3[extra]
-
-# For Linux/macOS with CUDA (select appropriate version):
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
-pip install stable-baselines3[extra]
-
-# For macOS with ARM64 (Apple Silicon):
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
-pip install stable-baselines3[extra]
 ```
 
-### Environment Setup
-
-Before running the live trading bot, set up your API keys in the `.env` file:
+### Подготовка данных
 
 ```bash
-# Copy the template
-cp .env.example .env
+# Скачивание данных
+python get_price_data.py
 
-# Edit the file with your API keys
-nano .env
+# Генерация признаков
+python feature_engineer.py
 ```
 
-⚠️ **Security Warning**: Never commit your actual API keys to version control. The `.env` file is already included in `.gitignore`.
-
-### Data Preparation
-
-1. Download historical market data (CSV format) for your preferred assets
-2. Place data in `data/` directory
-3. Run feature engineering:
+### Обучение модели
 
 ```bash
-python scripts/feature_engineering.py --data data/btc_usdt_historical.csv
+# Быстрое обучение (тестирование)
+python train_rl_balanced.py --timesteps 100000
+
+# Полное обучение
+python train_rl_balanced.py --timesteps 500000 --n_envs 8
 ```
 
-### Training
+### Оценка модели
 
 ```bash
-# Train PPO model with reproducible results
-python -m train_rl train ppo --data data/btc_usdt_feature_engineered.csv --timesteps 1000000
+# Paper trading на случайных срезах данных
+python rl_paper_trading.py --slices --n_episodes 10
 
-# Optimize hyperparameters
-python -m hyperparameter_optimization --n_trials 100
+# Полная оценка
+python rl_paper_trading.py
 ```
 
-### Paper Trading
+### Мониторинг обучения
 
 ```bash
-# Run paper trading simulation
-python -m rl_paper_trading --model models/dqn_trained.zip --data data/btc_usdt_test.csv --balance 10000
+tensorboard --logdir ./rl_tensorboard/
 ```
 
-### Live Trading
+## ⚙️ Гиперпараметры PPO
+
+| Параметр | Значение | Описание |
+|----------|----------|----------|
+| `learning_rate` | 3e-5 | Скорость обучения |
+| `batch_size` | 256 | Размер батча |
+| `n_epochs` | 5 | Эпохи обучения за обновление |
+| `clip_range` | 0.1 | Границы clipping для PPO |
+| `ent_coef` | 0.05 | Коэффициент энтропии |
+| `gamma` | 0.99 | Дисконтирование |
+| `gae_lambda` | 0.95 | GAE параметр |
+
+## 📊 Функция награды
+
+### Компоненты награды
+
+1. **Бонус за закрытие**: +2.0 за любое закрытие позиции
+2. **PnL награда**: `pnl_pct × 100` за прибыльную сделку
+3. **Hold penalty**: Прогрессивный штраф за долгое удержание (до -5.0)
+4. **Balance penalty**: Штраф за дисбаланс лонг/шорт
+5. **Unclosed penalty**: -5.0 за незакрытую позицию в конце эпизода
+
+## 📈 Технические индикаторы
+
+### Trend Indicators
+- EMA (15, 60, 300 периодов)
+- MACD (26, 12, 9)
+- Linear Regression
+
+### Momentum Indicators
+- RSI (15, 60, 300)
+- Stochastic Oscillator
+- Williams %R
+- Ultimate Oscillator
+
+### Volatility Indicators
+- Bollinger Bands (15, 60, 300)
+- ATR (15, 60)
+- NATR
+
+### Volume Indicators
+- OBV (On-Balance Volume)
+- AD (Accumulation/Distribution)
+- MFI (Money Flow Index)
+
+## 🧪 Тестирование
 
 ```bash
-# Run live trading (virtual mode)
-python -m rl_live_trading --model models/ppo_trained.zip --symbol BTC-USDT --balance 10000 --test-mode
+# Запуск paper trading
+python rl_paper_trading.py --model ppo_trading_agent --slices --n_episodes 5
+
+# Оценка на тестовых данных
+python eval_model.py --model rl_models/best_model.zip
 ```
 
-## 📊 Model Performance
+## 📁 Выходные файлы
 
-### Evaluation Metrics
+| Файл | Описание |
+|------|----------|
+| `rl_evaluation_log.txt` | Логи оценки во время обучения |
+| `rl_comprehensive_evaluation.pkl` | Результаты комплексной оценки |
+| `rl_models/best_model.zip` | Лучшая модель по результатам валидации |
+| `rl_checkpoints/` | Промежуточные чекпоинты |
 
-| Metric | Description |
-|--------|-------------|
-| Total Return | Overall percentage return |
-| Sharpe Ratio | Risk-adjusted return |
-| Maximum Drawdown | Largest peak-to-trough decline |
-| Win Rate | Percentage of profitable trades |
-| Profit Factor | Gross profit / Gross loss |
-| Expectancy | Average profit per trade |
+## ⚠️ Важные исправления (FIX v4)
 
-### Baseline Comparison
+### Решённые проблемы:
 
-The RL model is compared against:
+1. **Модель не закрывает позиции**
+   - Добавлен бонус +2.0 за любое закрытие
+   - Увеличен штраф за удержание (cap -5.0)
+   - Уменьшен `min_hold_steps` с 15 до 3
 
-- Buy & Hold strategy
-- Simple moving average crossover
-- RSI-based strategy
-- Random walk benchmark
+2. **Двойная нормализация**
+   - `VecNormalize(norm_obs=False)` — нормализация только в `_get_state()`
 
-## 🔧 Configuration
+3. **Дисбаланс лонг/шорт**
+   - Бонусы за недопредставленное направление
+   - Штраф за концентрацию >65%
 
-Configuration parameters can be adjusted in `config/trading_config.yaml`:
+## 📞 Поддержка
 
-```yaml
-# Trading Parameters
-initial_balance: 10000
-transaction_fee: 0.001
-max_position_size: 0.25
-max_total_exposure: 0.50
-
-# Risk Management
-stop_loss_pct: 0.08
-take_profit_pct: 0.15
-max_drawdown_limit: 0.20
-max_volatility_limit: 0.50
-
-# RL Parameters
-learning_rate: 0.0003
-batch_size: 128
-buffer_size: 100000
-exploration_fraction: 0.1
-```
-
-## 📈 Monitoring
-
-The system provides real-time monitoring through:
-
-- Console logging with key metrics
-- TensorBoard integration for training visualization
-- Performance dashboards
-- Risk alerts and notifications
-
-## 🧪 Testing
-
-Run tests to verify system functionality:
-
-```bash
-# Run unit tests
-python -m pytest tests/unit/
-
-# Run integration tests
-python -m pytest tests/integration/
-
-# Run performance tests
-python -m pytest tests/performance/
-```
-
-## 🤝 Contributing
-
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
-
-## 📄 License
-
-This project is licensed under the MIT License - see the LICENSE file for details.
+При возникновении проблем создайте issue в GitHub репозитории.
 
 ## ⚠️ Disclaimer
 
-**This is a research project for educational purposes. Trading cryptocurrencies involves substantial risk and may not be suitable for all investors. Past performance does not guarantee future results. Never invest more than you can afford to lose.**
+**Это образовательный проект. Торговля криптовалютами сопряжена с высокими рисками. Никогда не инвестируйте средства, которые не можете позволить себе потерять.**
 
-The authors are not responsible for any financial losses incurred through the use of this software.
-
-## 📞 Support
-
-For support, please open an issue in the GitHub repository or contact the maintainers.
+Авторы не несут ответственности за финансовые потери при использовании данного ПО.
 
 ---
 

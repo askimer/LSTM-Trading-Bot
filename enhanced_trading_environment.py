@@ -32,7 +32,7 @@ class EnhancedTradingEnvironment(gym.Env):
         self.enable_strategy_balancing = enable_strategy_balancing
 
         # Enhanced risk management parameters
-        self.max_position_size = 0.15
+        self.max_position_size = 0.10  # Exactly one trade
         self.max_total_exposure = 0.40
         self.stop_loss_pct = 0.08
         self.take_profit_pct = 0.15
@@ -41,7 +41,7 @@ class EnhancedTradingEnvironment(gym.Env):
         # Dynamic position sizing parameters
         self.volatility_window = 20
         self.min_position_size = 0.02
-        self.max_dynamic_position_size = 0.20
+        self.max_dynamic_position_size = 0.10  # Match max_position_size
         
         # Adaptive stop-loss parameters
         self.adaptive_stop_loss_enabled = True
@@ -59,11 +59,18 @@ class EnhancedTradingEnvironment(gym.Env):
         self.trailing_stop_enabled = True
 
         # Trading parameters
-        self.base_position_size = 0.08
+        self.base_position_size = 0.10  # Match max_position_size for single trade
         self.hold_penalty = 0.00001
         self.inactivity_penalty = 0.0001
         self.termination_stop_loss_threshold = 0.95
         self.termination_profit_target = 1.50
+
+        # Anti-overtrading parameters
+        # FIX v3: min_hold_steps снижен с 15 до 3 — иначе первые 15 шагов каждая попытка
+        # закрыть позицию штрафовалась -0.5, что учило модель НИКОГДА не закрывать позиции.
+        self.min_hold_steps = 3         # Minimum steps to hold position before manual close
+        self.min_open_cooldown = 5      # Minimum steps after close before opening new position
+        self.hold_penalty_start = 10    # Steps after entry before hold penalty kicks in (was 35)
 
         # Reward parameters
         self.reward_clip_bounds = (-50, 50)
@@ -110,17 +117,24 @@ class EnhancedTradingEnvironment(gym.Env):
         # Actions: 0=Hold, 1=Buy Long, 2=Sell Long, 3=Sell Short, 4=Cover Short
         self.action_space = spaces.Discrete(5)
 
-        # State: [balance_norm, position_norm, price_norm, indicators...]
-        n_indicators = 7
+        # State: [balance_norm, position_norm, price_norm, can_close, steps_to_close_norm, unrealized_pnl, indicators...]
+        # FIX v3: Replaced has_long/has_short (binary flags destroyed by VecNormalize) with:
+        #   can_close         = 1.0 if position exists AND min_hold_steps passed (can close NOW)
+        #   steps_to_close_norm = countdown 1→0 until close is allowed (0 when no position or can close)
+        # position_norm sign already encodes direction: >0=long, <0=short
+        # Indicators: RSI, BB_upper, BB_lower, ATR, short_trend, medium_trend, MFI,
+        #             MACD_macd, MACD_signal, MACD_hist, Stoch_k, Stoch_d
+        n_indicators = 12
+        n_base_features = 6  # balance_norm, position_norm, price_norm, can_close, steps_to_close_norm, unrealized_pnl
         self.observation_space = spaces.Box(
-            low=np.array([-2.0, -2.5, -15.0] + [-1.0] * n_indicators, dtype=np.float32),
-            high=np.array([2.0, 2.5, 15.0] + [1.0] * n_indicators, dtype=np.float32),
+            low=np.array([-2.0, -2.5, -15.0, 0.0, 0.0, -1.0] + [-1.0] * n_indicators, dtype=np.float32),
+            high=np.array([2.0, 2.5, 15.0, 1.0, 1.0, 1.0] + [1.0] * n_indicators, dtype=np.float32),
             dtype=np.float32
         )
 
         # Add state normalization parameters
-        self.state_means = np.array([0.0, 0.0, 0.0] + [0.0] * n_indicators, dtype=np.float32)
-        self.state_stds = np.array([1.0, 1.0, 3.0] + [0.5] * n_indicators, dtype=np.float32)
+        self.state_means = np.array([0.0, 0.0, 0.0, 0.5, 0.5, 0.0] + [0.0] * n_indicators, dtype=np.float32)
+        self.state_stds = np.array([1.0, 1.0, 3.0, 0.5, 0.5, 0.5] + [0.5] * n_indicators, dtype=np.float32)
 
         self.reset()
 
@@ -231,6 +245,10 @@ class EnhancedTradingEnvironment(gym.Env):
         self.direction_streak = 0
         self.last_direction = None
         self.direction_exploration_bonuses = {'long': 0, 'short': 0}
+
+        # Anti-overtrading state
+        self.last_close_step = -999   # When last position was closed (-999 = no recent close)
+        self.last_trade_hold_steps = 0  # How long was the last closed trade held
         
         # Initialize previous price for reward calculation
         current_price = self.df.iloc[self.current_step].get('close', self.df.iloc[self.current_step].get('Close', 500))
@@ -251,7 +269,7 @@ class EnhancedTradingEnvironment(gym.Env):
         return self._get_state(), {}
 
     def _get_state(self):
-        """Get current state observation"""
+        """Get current state observation with enhanced trend information"""
         if self.current_step >= len(self.df):
             return np.zeros(self.observation_space.shape)
 
@@ -281,17 +299,31 @@ class EnhancedTradingEnvironment(gym.Env):
         if np.isnan(atr) or np.isinf(atr) or atr <= 0:
             atr = 10
 
-        obv = row.get('OBV', 0)
-        if np.isnan(obv) or np.isinf(obv):
-            obv = 0
-
-        ad = row.get('AD', 0)
-        if np.isnan(ad) or np.isinf(ad):
-            ad = 0
-
         mfi = row.get('MFI_15', 50)
         if np.isnan(mfi) or np.isinf(mfi) or mfi < 0 or mfi > 100:
             mfi = 50
+
+        # MACD indicators for trend confirmation
+        macd = row.get('MACD_default_macd', 0)
+        if np.isnan(macd) or np.isinf(macd):
+            macd = 0
+
+        macd_signal = row.get('MACD_default_signal', 0)
+        if np.isnan(macd_signal) or np.isinf(macd_signal):
+            macd_signal = 0
+
+        macd_hist = row.get('MACD_default_histogram', 0)
+        if np.isnan(macd_hist) or np.isinf(macd_hist):
+            macd_hist = 0
+
+        # Stochastic oscillator for overbought/oversold
+        stoch_k = row.get('Stochastic_slowk', 50)
+        if np.isnan(stoch_k) or np.isinf(stoch_k) or stoch_k < 0 or stoch_k > 100:
+            stoch_k = 50
+
+        stoch_d = row.get('Stochastic_slowd', 50)
+        if np.isnan(stoch_d) or np.isinf(stoch_d) or stoch_d < 0 or stoch_d > 100:
+            stoch_d = 50
 
         # Normalize values
         balance_norm = self.balance / self.initial_balance - 1
@@ -320,18 +352,85 @@ class EnhancedTradingEnvironment(gym.Env):
             if prev_price > 0 and not np.isnan(prev_price) and not np.isinf(prev_price):
                 price_norm = np.log(current_price / prev_price) * 10  # Scale up for better learning
 
-        # Technical indicators with validation
+        # Calculate price trends (short and medium term)
+        short_trend = 0  # 5-step trend
+        medium_trend = 0  # 20-step trend
+        
+        if self.current_step >= 5:
+            try:
+                prev_price_5 = self.df.iloc[self.current_step - 5].get('close', 
+                              self.df.iloc[self.current_step - 5].get('Close', current_price))
+                if prev_price_5 > 0 and not np.isnan(prev_price_5):
+                    short_trend = (current_price - prev_price_5) / prev_price_5
+                    short_trend = np.clip(short_trend, -0.1, 0.1) * 10  # Scale and clip
+            except:
+                pass
+        
+        if self.current_step >= 20:
+            try:
+                prev_price_20 = self.df.iloc[self.current_step - 20].get('close', 
+                               self.df.iloc[self.current_step - 20].get('Close', current_price))
+                if prev_price_20 > 0 and not np.isnan(prev_price_20):
+                    medium_trend = (current_price - prev_price_20) / prev_price_20
+                    medium_trend = np.clip(medium_trend, -0.2, 0.2) * 5  # Scale and clip
+            except:
+                pass
+
+        # Calculate unrealized PnL for current position
+        unrealized_pnl = 0
+        if self.position != 0 and self.entry_price > 0:
+            if self.position > 0:  # Long position
+                unrealized_pnl = (current_price - self.entry_price) / self.entry_price
+            else:  # Short position
+                unrealized_pnl = (self.entry_price - current_price) / self.entry_price
+            unrealized_pnl = np.clip(unrealized_pnl, -0.5, 0.5) * 2  # Scale for visibility
+
+        # FIX v3: Replace has_long/has_short (binary flags destroyed by VecNormalize running stats)
+        # with semantically meaningful continuous features:
+        #   can_close         = 1.0 when position is open AND min_hold_steps elapsed → model knows it CAN close
+        #   steps_to_close_norm = countdown ratio from 1.0 (just opened) → 0.0 (can close now)
+        # position_norm SIGN already encodes direction: positive=long, negative=short
+        steps_held_now = int(self.current_step - self.entry_step) if self.position != 0 else 0
+        can_close = 1.0 if (self.position != 0 and steps_held_now >= self.min_hold_steps) else 0.0
+        steps_to_close_norm = (
+            max(0.0, (self.min_hold_steps - steps_held_now) / max(self.min_hold_steps, 1))
+            if self.position != 0 else 0.0
+        )
+
+        # Technical indicators with validation - replaced OBV/AD with trends
+        # Normalize MACD values - they can be positive or negative, scale by typical price
+        macd_norm = macd / current_price * 100 if current_price > 0 else 0  # Scale to reasonable range
+        macd_signal_norm = macd_signal / current_price * 100 if current_price > 0 else 0
+        macd_hist_norm = macd_hist / current_price * 100 if current_price > 0 else 0
+        
         indicators = [
             rsi / 100 - 0.5,  # RSI normalized to [-0.5, 0.5]
             (bb_upper / current_price - 1) if current_price > 0 else 0,  # BB upper as % deviation
             (bb_lower / current_price - 1) if current_price > 0 else 0,  # BB lower as % deviation
             atr / 1000,  # ATR normalized
-            obv / 1e10,  # OBV normalized
-            ad / 1e10, # AD normalized
-            mfi / 100 - 0.5  # MFI normalized to [-0.5, 0.5]
+            short_trend,  # 5-step price trend (replaced OBV)
+            medium_trend,  # 20-step price trend (replaced AD)
+            mfi / 100 - 0.5,  # MFI normalized to [-0.5, 0.5]
+            # MACD indicators for trend confirmation
+            np.clip(macd_norm, -1, 1),  # MACD line normalized
+            np.clip(macd_signal_norm, -1, 1),  # MACD signal line normalized
+            np.clip(macd_hist_norm, -1, 1),  # MACD histogram normalized
+            # Stochastic oscillator for overbought/oversold
+            stoch_k / 100 - 0.5,  # Stochastic K normalized to [-0.5, 0.5]
+            stoch_d / 100 - 0.5,  # Stochastic D normalized to [-0.5, 0.5]
         ]
 
-        state = np.array([balance_norm, position_norm, price_norm] + indicators, dtype=np.float32)
+        # Build state: position_norm encodes direction (sign) + magnitude,
+        # can_close tells model it CAN act on SELL_LONG/COVER_SHORT right now,
+        # steps_to_close_norm is a countdown to when close becomes allowed.
+        state = np.array([
+            balance_norm,
+            position_norm,          # >0 = long, <0 = short, 0 = flat
+            price_norm,
+            can_close,              # 1.0 = position open AND min_hold elapsed → can close NOW
+            steps_to_close_norm,    # 1.0 = just opened, 0.0 = can close (or no position)
+            unrealized_pnl
+        ] + indicators, dtype=np.float32)
         # Protect against NaN and inf values that could break the neural network
         state = np.nan_to_num(state, nan=0.0, posinf=5.0, neginf=-5.0)
         # Additional safety: clip to observation space bounds to ensure numerical stability
@@ -459,81 +558,85 @@ class EnhancedTradingEnvironment(gym.Env):
 
     def _calculate_reward(self, current_price, action, action_performed=False, pnl_pct=None):
         """
-        Enhanced reward function with strategy balancing
-        
-        Key components:
-        1. Base reward: portfolio change
-        2. Trade reward: PnL from closed trades (with direction multipliers)
-        3. Strategy balance reward: incentives for balanced trading
-        4. Hold penalty: discourage excessive inactivity
-        5. Market comparison: reward beating the market
+        Reward function with explicit position awareness.
+
+        FIX v2: Removed base_reward=2.0 bug that gave positive reward for losses.
+        Now losses correctly produce negative reward signal.
+
+        Core principle:
+        - Profit close  → +reward proportional to pnl
+        - Loss close    → -reward proportional to pnl  (no base bonus!)
+        - Invalid open  → small penalty
+        - Hold too long → progressive hold penalty
+        - Strategy balance reward for direction diversity
         """
-        # Calculate current equity (portfolio value)
-        current_portfolio = self.balance + self.margin_locked + self.position * current_price
+        reward = 0.0
 
-        # Base reward: portfolio change
-        if self.prev_portfolio_value > 0:
-            portfolio_return = (current_portfolio - self.prev_portfolio_value) / self.prev_portfolio_value
-            base_reward = portfolio_return * 100
-        else:
-            base_reward = 0.0
-
-        # Trade reward (if trade was performed) with direction multipliers
-        trade_reward = 0
-        if action_performed and pnl_pct is not None:
-            # Apply direction-specific multipliers for profitable trades
+        # Reward/penalty for closing positions
+        # FIX v4: close_bonus=+2.0 применяется к ЛЮБОМУ закрытию (profit И loss).
+        # Это критически важно: без этого модель видит «закрыть убыточно = -5» vs «держать = -0.1/шаг»
+        # и выбирает бесконечно держать. С бонусом: «закрыть убыточно = -5+2 = -3» vs «держать 30 шагов = -3».
+        # Математически выгоднее закрыть, чем держать более ~30 шагов.
+        if action in [2, 4] and action_performed and pnl_pct is not None:
+            close_bonus = 2.0  # Бонус за ЛЮБОЕ закрытие (profit или loss) — мотивирует модель закрывать
+            reward += close_bonus
             if pnl_pct > 0:
-                # Check if this was a long or short trade
-                if action == 2:  # Sell Long (closing long position)
-                    trade_reward = pnl_pct * 100 * self.long_reward_multiplier
-                elif action == 4:  # Cover Short (closing short position)
-                    trade_reward = pnl_pct * 100 * self.short_reward_multiplier
-                else:
-                    trade_reward = pnl_pct * 100
+                # Profit: scaled reward + additional profit bonus
+                reward += pnl_pct * 100.0 + 1.0
             else:
-                # Smaller penalty for losses to encourage risk-taking
-                trade_reward = pnl_pct * 50
+                # Loss: clear negative signal proportional to loss
+                reward += pnl_pct * 100.0
 
-        # Action diversity reward
-        action_diversity_reward = 0
-        if len(self.action_history) >= 2:
-            unique_actions = len(set(self.action_history))
-            if unique_actions >= 3:
-                action_diversity_reward = 0.1
+        # Penalty for trying to close non-existent position.
+        # FIX v3: Distinguish "no position" (real mistake, penalize) from
+        # "blocked by min_hold_steps" (position exists but too early — NO penalty!).
+        # Previously both cases gave -0.5, which trained the model to NEVER close positions.
+        if action == 2 and not action_performed:
+            if self.position <= 0:
+                # Truly no long position to close → penalize
+                reward += -0.5
+            # else: position > 0 but blocked by min_hold_steps → no penalty, model is just early
+        if action == 4 and not action_performed:
+            if self.position >= 0:
+                # Truly no short position to close → penalize
+                reward += -0.5
+            # else: position < 0 but blocked by min_hold_steps → no penalty
 
-        # Hold penalty
-        hold_penalty = 0
-        if action == 0:
-            if self.steps_since_last_trade > 5:
-                hold_penalty = -0.05
+        # Penalty for invalid opening actions (position already open)
+        if action == 1 and not action_performed:  # BUY_LONG failed
+            if self.position > 0:
+                reward += -0.5  # Already in long
+            elif self.position < 0:
+                reward += -0.3  # In short — need COVER_SHORT first
 
-        # Market comparison reward
-        market_comparison_reward = 0
-        if hasattr(self, 'prev_price') and self.prev_price > 0:
-            market_return = (current_price - self.prev_price) / self.prev_price
-            excess_return = portfolio_return - market_return
-            if excess_return > 0.001:
-                market_comparison_reward = excess_return * 50
+        if action == 3 and not action_performed:  # SELL_SHORT failed
+            if self.position < 0:
+                reward += -0.5  # Already in short
+            elif self.position > 0:
+                reward += -0.3  # In long — need SELL_LONG first
 
-        # Episode length penalty
-        episode_length_penalty = 0
-        if self.steps_in_episode < self.min_episode_length_for_rewards:
-            missing_steps = self.min_episode_length_for_rewards - self.steps_in_episode
-            episode_length_penalty = -missing_steps * 0.2
+        # Hold penalty: прогрессивный, усиленный.
+        # FIX v4: cap поднят до -5.0 (было -1.0).
+        # Математика: закрыть убыточно (-5+2=-3) vs держать (максимум -5/шаг).
+        # При hold_penalty_start=10: после 10 шагов штраф растёт 0.1/шаг.
+        # За 30 шагов накопится -2.0 hold_penalty → закрыть выгоднее.
+        if self.position != 0 and self.entry_step > 0:
+            steps_held = self.current_step - self.entry_step
+            if steps_held > self.hold_penalty_start:
+                hold_penalty = -0.1 * (steps_held - self.hold_penalty_start) / 10
+                reward += max(hold_penalty, -5.0)   # FIX v4: cap -1.0 → -5.0, ставка -0.05 → -0.1
 
-        # Strategy balance reward (ENHANCED COMPONENT)
-        strategy_balance_reward = self._calculate_strategy_balance_reward(action)
+        # FIX v4: Убран бонус +0.05 за открытие позиции.
+        # Этот бонус провоцировал спам BUY_LONG: модель открывала позицию ради +0.05,
+        # затем игнорировала SELL_LONG, снова открывала (blocked → -0.5),
+        # но суммарно спам открытий всё равно давал положительный сигнал из-за нормализации наград.
+        # Убрать бонус → модель получает reward ТОЛЬКО за прибыльное закрытие.
 
-        # Combine all components
-        reward = (base_reward + trade_reward + action_diversity_reward + 
-                 hold_penalty + market_comparison_reward + 
-                 episode_length_penalty + strategy_balance_reward)
-        
+        # Strategy balancing reward (encourage direction diversity)
+        reward += self._calculate_strategy_balance_reward(action)
+
         # Save previous price for next step
         self.prev_price = current_price
-
-        # Clip reward for stability
-        reward = np.clip(reward, -20, 20)
 
         return reward
 
@@ -585,14 +688,14 @@ class EnhancedTradingEnvironment(gym.Env):
             if len(self.action_history) > self.max_action_history:
                 self.action_history.pop(0)
 
-            # Update strategy balance tracking
-            self._update_strategy_balance_tracking(action_int)
-
-            # Execute action
+            # Execute action FIRST, then update strategy tracking only if performed
             if action == 0:  # Hold
                 self.steps_since_last_trade += 1
             elif action == 1:  # Buy Long
                 action_performed = self._execute_buy_long(current_price, max_order_size_long, min_order_size)
+                if action_performed:
+                    # Only count successfully opened positions in direction tracking
+                    self._update_strategy_balance_tracking(action_int)
             elif action == 2:  # Sell Long
                 action_performed, pnl_pct = self._execute_sell_long(current_price)
                 if action_performed:
@@ -603,6 +706,9 @@ class EnhancedTradingEnvironment(gym.Env):
                             self.consecutive_losses += 1
             elif action == 3:  # Sell Short
                 action_performed = self._execute_sell_short(current_price, max_order_size_short, min_order_size)
+                if action_performed:
+                    # Only count successfully opened positions in direction tracking
+                    self._update_strategy_balance_tracking(action_int)
             elif action == 4:  # Cover Short
                 action_performed, pnl_pct = self._execute_cover_short(current_price)
                 if action_performed:
@@ -662,46 +768,28 @@ class EnhancedTradingEnvironment(gym.Env):
                 final_portfolio = current_portfolio
                 portfolio_return = (final_portfolio - self.initial_balance) / self.initial_balance if self.initial_balance > 0 else 0
                 
-                # Final reward based on overall performance (log return)
-                if self.prev_portfolio_value > 0:
-                    final_return = (final_portfolio - self.prev_portfolio_value) / self.prev_portfolio_value
-                    final_reward = np.log(1 + final_return) * 200
-                else:
-                    final_reward = portfolio_return * 200
-                
-                # Bonus for overall performance
-                if portfolio_return > 0.1:
-                    final_reward += 15
-                elif portfolio_return > 0.05:
-                    final_reward += 8
-                elif portfolio_return > 0.02:
-                    final_reward += 3
-                elif portfolio_return > 0:
-                    final_reward += 1
-                
-                # Penalty for poor performance
-                if portfolio_return < -0.1:
-                    final_reward -= 15
-                elif portfolio_return < -0.05:
-                    final_reward -= 8
-                elif portfolio_return < -0.02:
-                    final_reward -= 3
-                
-                # Bonus for active trading
-                if self.total_trades > 0:
-                    trade_bonus = min(self.total_trades * 0.5, 5.0)
-                    final_reward += trade_bonus
-                    
-                    # Additional bonus for good win rate
-                    win_rate = self.win_count / self.total_trades if self.total_trades > 0 else 0
-                    if win_rate > 0.6:
-                        final_reward += 3
-                    elif win_rate > 0.5:
-                        final_reward += 1
-                
-                # Penalty for no trading
+                # ========================================
+                # EPISODE-LEVEL REWARD: Final PnL
+                # FIX v2: Reduced scale from *1000 to *100 to prevent gradient NaN
+                # ========================================
+                final_reward = portfolio_return * 100.0
+
+                # Small penalty for no trading (to encourage exploration)
                 if self.total_trades == 0:
-                    final_reward -= 5
+                    final_reward -= 0.5
+
+                # Penalty for leaving a position open at end of episode
+                # FIX v4: Штраф увеличен -2.0 → -5.0.
+                # Обоснование: модель должна чётко понимать что НЕ ЗАКРЫТЬ позицию к концу эпизода = большой штраф.
+                # -5.0 > hold_penalty_cap (-5.0/шаг) → эпизод-уровень штраф существенен.
+                # Сравнение: close_bonus=+2.0 + pnl(-5%) = -3.0 < -5.0 (штраф за незакрытие)
+                # → закрыть даже с убытком выгоднее, чем не закрыть вообще.
+                if self.position != 0:
+                    steps_open = self.steps_in_episode - max(0, self.entry_step - self.episode_start_step)
+                    unclosed_penalty = -(5.0 + 0.05 * steps_open)  # Прогрессивный: -5 + -0.05/шаг
+                    final_reward += unclosed_penalty
+                    if self.debug:
+                        print(f"Episode ended with open position! Penalty={unclosed_penalty:.2f} (steps_open={steps_open})")
 
                 # Add strategy balance metrics to final info
                 episode_info = {
@@ -853,7 +941,26 @@ class EnhancedTradingEnvironment(gym.Env):
         return max_order_size_long, max_order_size_short, min_order_size
 
     def _execute_buy_long(self, current_price, max_order_size_long, min_order_size):
-        """Execute buy long action"""
+        """Execute buy long action
+        
+        IMPORTANT: 
+        - If there's an open short position, do NOT open long (use COVER_SHORT first).
+        - If there's already an open long position, do NOT pyramid (use SELL_LONG first).
+        This forces the model to learn proper position management.
+        """
+        # If we have a short position, refuse to open long
+        if self.position < 0:
+            return False
+        
+        # If we already have a long position, refuse to pyramid
+        if self.position > 0:
+            return False
+
+        # Cooldown: enforce minimum pause between trades to prevent overtrading
+        if self.current_step - self.last_close_step < self.min_open_cooldown:
+            return False
+
+        # Normal buy long logic
         if max_order_size_long >= min_order_size and self.balance > max_order_size_long and current_price > 0:
             invest_amount = min(max_order_size_long, self.balance)
             fee = invest_amount * self.transaction_fee
@@ -890,6 +997,11 @@ class EnhancedTradingEnvironment(gym.Env):
     def _execute_sell_long(self, current_price):
         """Execute sell long action"""
         if self.position > 0:
+            # Minimum hold check: block premature close to avoid overtrading
+            steps_held = self.current_step - self.entry_step
+            if steps_held < self.min_hold_steps:
+                return False, 0
+
             position_size = self.position
             revenue = position_size * current_price
             fee = revenue * self.transaction_fee
@@ -909,6 +1021,10 @@ class EnhancedTradingEnvironment(gym.Env):
             else:
                 self.loss_count += 1
 
+            # Track close timing for cooldown and reporting
+            self.last_trade_hold_steps = steps_held
+            self.last_close_step = self.current_step
+
             self.position = 0
             self.entry_price = 0
             self.entry_step = 0
@@ -923,7 +1039,32 @@ class EnhancedTradingEnvironment(gym.Env):
         return False, 0
 
     def _execute_sell_short(self, current_price, max_order_size_short, min_order_size):
-        """Execute sell short action"""
+        """Execute sell short action
+        
+        CORRECTED LOGIC:
+        - When opening short: we borrow coins and sell them
+        - Proceeds from sale are blocked as collateral (margin_locked)
+        - We also provide additional margin from our balance
+        - Position becomes negative (amount of coins we owe)
+        
+        IMPORTANT: 
+        - If there's an open long position, do NOT open short (use SELL_LONG first).
+        - If there's already an open short position, do NOT pyramid (use COVER_SHORT first).
+        This forces the model to learn proper position management.
+        """
+        # If we have a long position, refuse to open short
+        if self.position > 0:
+            return False
+        
+        # If we already have a short position, refuse to pyramid
+        if self.position < 0:
+            return False
+
+        # Cooldown: enforce minimum pause between trades to prevent overtrading
+        if self.current_step - self.last_close_step < self.min_open_cooldown:
+            return False
+
+        # Normal sell short logic
         if max_order_size_short >= min_order_size and self.balance > max_order_size_short and current_price > 0:
             short_amount = min(max_order_size_short, self.balance)
             margin_required = short_amount * self.margin_requirement
@@ -935,9 +1076,12 @@ class EnhancedTradingEnvironment(gym.Env):
                 
                 self.short_opening_fees = fee
 
-                self.margin_locked += margin_required
-                self.balance -= margin_required
-                self.balance += short_amount - fee
+                # CORRECTED: 
+                # - margin_locked includes: sale proceeds (short_amount) + our margin (margin_required)
+                # - balance decreases by: our margin + fee
+                # - This way portfolio value stays correct
+                self.margin_locked += short_amount + margin_required  # Total collateral
+                self.balance -= margin_required + fee  # Only deduct our margin and fee
                 self.position -= coins_short
                 self.total_fees += fee
                 self.fees_step += fee
@@ -965,20 +1109,38 @@ class EnhancedTradingEnvironment(gym.Env):
         return False
 
     def _execute_cover_short(self, current_price):
-        """Execute cover short action"""
+        """Execute cover short action
+        
+        CORRECTED LOGIC:
+        - When closing short: we buy back the coins we owe
+        - margin_locked includes: sale proceeds + our margin
+        - We use sale proceeds to buy back coins
+        - PnL = sale_proceeds - buy_cost - fees
+        - We get back: our margin + PnL
+        """
         if self.position < 0:
+            # Minimum hold check: block premature close to avoid overtrading
+            steps_held = self.current_step - self.entry_step
+            if steps_held < self.min_hold_steps:
+                return False, 0
+
             position_size = abs(self.position)
 
-            price_pnl = (self.entry_price - current_price) * position_size
+            # Calculate PnL correctly
+            sale_proceeds = position_size * self.entry_price  # What we got when we sold
+            buy_cost = position_size * current_price  # What we pay to buy back
+            close_fee = buy_cost * self.transaction_fee
             
-            open_fee = self.short_opening_fees
-            close_fee = current_price * position_size * self.transaction_fee
-            total_fee = close_fee
-            
+            # PnL = sale_proceeds - buy_cost - fees
+            price_pnl = sale_proceeds - buy_cost
             pnl = price_pnl - close_fee
-            pnl_pct = pnl / (self.entry_price * position_size) if self.entry_price > 0 else 0
+            pnl_pct = pnl / sale_proceeds if sale_proceeds > 0 else 0
 
-            self.balance += self.margin_locked + pnl
+            # Our margin was: sale_proceeds * margin_requirement
+            our_margin = sale_proceeds * self.margin_requirement
+
+            # Return our margin + PnL to balance
+            self.balance += our_margin + pnl
             self.margin_locked = 0
             self.total_fees += close_fee
             self.fees_step += close_fee

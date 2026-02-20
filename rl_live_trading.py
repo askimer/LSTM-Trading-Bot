@@ -51,7 +51,7 @@ class RLLiveTradingBot:
     Live trading bot that uses trained RL model for virtual trading on real market data
     """
 
-    def __init__(self, model_path, symbol='BTC-USDT', test_mode=True, initial_balance=1000):
+    def __init__(self, model_path, symbol='BTC-USDT', test_mode=True, initial_balance=10000):
         """
         Initialize the RL trading bot
 
@@ -59,11 +59,17 @@ class RLLiveTradingBot:
             model_path: Path to trained RL model (.zip)
             symbol: Trading symbol (default: BTC-USDT)
             test_mode: If True, only virtual trades (no real transactions)
-            initial_balance: Virtual balance in USDT
+            initial_balance: Virtual balance in USDT (MUST match training initial_balance=10000)
         """
         self.symbol = symbol
         self.test_mode = test_mode
         self.initial_balance = initial_balance
+        self.training_initial_balance = 10000  # Must match the value used during training
+        
+        # CRITICAL: Warn if initial_balance doesn't match training
+        if initial_balance != 10000:
+            logger.warning(f"WARNING: initial_balance={initial_balance} differs from training value (10000). "
+                         f"This will cause state normalization mismatch and unpredictable behavior!")
 
         # Load RL model
         print(f"Loading RL model from {model_path}...")
@@ -150,6 +156,7 @@ class RLLiveTradingBot:
         logger.info(f"Initialized RL Live Trading Bot for {symbol}")
         logger.info(f"Test mode: {test_mode}")
         logger.info(f"Initial balance: {self.initial_balance} USDT")
+        logger.info(f"Training initial balance: {self.training_initial_balance} USDT (for state normalization)")
         logger.info(f"Using EnhancedTradingEnvironment for state calculation (same as training)")
 
     def init_csv_logging(self):
@@ -432,6 +439,32 @@ class RLLiveTradingBot:
                 else:
                     logger.warning(f"Insufficient data for MFI_{window} (need {window}, got {len(data)})")
                     indicators[f'MFI_{window}'] = 50.0
+            
+            # MACD indicators (26, 12, 9 parameters as in feature_engineer.py)
+            try:
+                ema_fast = close.ewm(span=12, adjust=False).mean()
+                ema_slow = close.ewm(span=26, adjust=False).mean()
+                macd = ema_fast - ema_slow
+                signal_line = macd.rolling(window=9).mean()
+                histogram = macd - signal_line
+                indicators['MACD_default_macd'] = safe_last_value(macd, 'MACD_default_macd')
+                indicators['MACD_default_signal'] = safe_last_value(signal_line, 'MACD_default_signal')
+                indicators['MACD_default_histogram'] = safe_last_value(histogram, 'MACD_default_histogram')
+            except Exception as e:
+                logger.warning(f"Error calculating MACD: {e}")
+                indicators['MACD_default_macd'] = 0.0
+                indicators['MACD_default_signal'] = 0.0
+                indicators['MACD_default_histogram'] = 0.0
+            
+            # Stochastic oscillator (14, 3, 3 parameters as in feature_engineer.py)
+            try:
+                stoch_indicator = ta.momentum.StochasticOscillator(high, low, close, window=14, smooth_window=3)
+                indicators['Stochastic_slowk'] = safe_last_value(stoch_indicator.stoch(), 'Stochastic_slowk')  # raw K
+                indicators['Stochastic_slowd'] = safe_last_value(stoch_indicator.stoch_signal(), 'Stochastic_slowd')  # smoothed D
+            except Exception as e:
+                logger.warning(f"Error calculating Stochastic: {e}")
+                indicators['Stochastic_slowk'] = 50.0
+                indicators['Stochastic_slowd'] = 50.0
 
             return indicators
 
@@ -482,6 +515,18 @@ class RLLiveTradingBot:
             # MFI_15
             env_df['MFI_15'] = ta.volume.MFIIndicator(high, low, close, volume, window=15).money_flow_index()
             
+            # MACD indicators (26, 12, 9 parameters as in feature_engineer.py)
+            ema_fast = close.ewm(span=12, adjust=False).mean()
+            ema_slow = close.ewm(span=26, adjust=False).mean()
+            env_df['MACD_default_macd'] = ema_fast - ema_slow
+            env_df['MACD_default_signal'] = env_df['MACD_default_macd'].rolling(window=9).mean()
+            env_df['MACD_default_histogram'] = env_df['MACD_default_macd'] - env_df['MACD_default_signal']
+            
+            # Stochastic oscillator (14, 3, 3 parameters as in feature_engineer.py)
+            stoch_indicator = ta.momentum.StochasticOscillator(high, low, close, window=14, smooth_window=3)
+            env_df['Stochastic_slowk'] = stoch_indicator.stoch()  # raw K
+            env_df['Stochastic_slowd'] = stoch_indicator.stoch_signal()  # smoothed D
+            
             # Fill NaN values
             env_df = env_df.bfill().ffill()
             
@@ -489,9 +534,10 @@ class RLLiveTradingBot:
             self.env_df = env_df
             
             # Create the EnhancedTradingEnvironment
+            # CRITICAL: Use training_initial_balance for correct state normalization
             self.live_env = EnhancedTradingEnvironment(
                 df=env_df,
-                initial_balance=self.initial_balance,
+                initial_balance=self.training_initial_balance,  # Use training value for state normalization
                 transaction_fee=0.0018,
                 episode_length=len(env_df),
                 start_step=len(env_df) - 1,  # Start at the latest data point
@@ -512,16 +558,27 @@ class RLLiveTradingBot:
             return False
 
     def _sync_env_state(self):
-        """Synchronize the EnhancedTradingEnvironment's internal state with live trading state"""
+        """Synchronize the EnhancedTradingEnvironment's internal state with live trading state
+        
+        CRITICAL: State normalization uses training_initial_balance, not live balance.
+        We need to scale the balance to match training normalization.
+        """
         if self.live_env is None:
             return
         
-        # Sync balance and position
-        self.live_env.balance = self.balance
+        # CRITICAL: Scale balance to training_initial_balance for correct state normalization
+        # The model expects states normalized with training_initial_balance (10000)
+        # So we need to present the balance as if it were in the training scale
+        balance_ratio = self.balance / self.initial_balance  # Current balance ratio
+        scaled_balance = self.training_initial_balance * balance_ratio  # Scale to training units
+        
+        # Sync balance (scaled for correct normalization)
+        self.live_env.balance = scaled_balance
         self.live_env.position = self.position
         
-        # Sync margin trading state
-        self.live_env.margin_locked = self.margin_locked
+        # Sync margin trading state (also scaled)
+        margin_ratio = self.margin_locked / self.initial_balance if self.initial_balance > 0 else 0
+        self.live_env.margin_locked = self.training_initial_balance * margin_ratio
         self.live_env.short_position_value = self.short_position * (self.short_entry_price if self.short_entry_price > 0 else 0)
         
         # Sync position tracking
@@ -531,9 +588,11 @@ class RLLiveTradingBot:
         self.live_env.trailing_stop_loss = self.trailing_stop_loss
         self.live_env.trailing_take_profit = self.trailing_take_profit
         
-        # Sync portfolio tracking
+        # Sync portfolio tracking (scaled)
         self.live_env.total_fees = self.total_fees
-        self.live_env.prev_portfolio_value = self.balance + self.margin_locked + self.position * (self.env_df['close'].iloc[-1] if self.env_df is not None else 0)
+        portfolio_value = self.balance + self.margin_locked + self.position * (self.env_df['close'].iloc[-1] if self.env_df is not None else 0)
+        portfolio_ratio = portfolio_value / self.initial_balance if self.initial_balance > 0 else 1.0
+        self.live_env.prev_portfolio_value = self.training_initial_balance * portfolio_ratio
         
         # Set current step to the last data point
         if self.env_df is not None:
@@ -579,6 +638,18 @@ class RLLiveTradingBot:
             
             # Update MFI_15
             self.env_df['MFI_15'] = ta.volume.MFIIndicator(high, low, close, volume, window=15).money_flow_index()
+            
+            # Update MACD indicators
+            ema_fast = close.ewm(span=12, adjust=False).mean()
+            ema_slow = close.ewm(span=26, adjust=False).mean()
+            self.env_df['MACD_default_macd'] = ema_fast - ema_slow
+            self.env_df['MACD_default_signal'] = self.env_df['MACD_default_macd'].rolling(window=9).mean()
+            self.env_df['MACD_default_histogram'] = self.env_df['MACD_default_macd'] - self.env_df['MACD_default_signal']
+            
+            # Update Stochastic oscillator
+            stoch_indicator = ta.momentum.StochasticOscillator(high, low, close, window=14, smooth_window=3)
+            self.env_df['Stochastic_slowk'] = stoch_indicator.stoch()  # raw K
+            self.env_df['Stochastic_slowd'] = stoch_indicator.stoch_signal()  # smoothed D
             
             # Fill NaN values
             self.env_df = self.env_df.bfill().ffill()
@@ -631,23 +702,68 @@ class RLLiveTradingBot:
 
             price_norm = (current_price - price_mean) / price_std if price_std > 0 else 0
 
-            # Technical indicators (same as in TradingEnvironment)
+            # Calculate price trends (short and medium term)
+            short_trend = 0
+            medium_trend = 0
+            if len(self.price_history) >= 5:
+                short_trend = (current_price - self.price_history[-5]) / self.price_history[-5] if self.price_history[-5] > 0 else 0
+                short_trend = np.clip(short_trend, -0.1, 0.1) * 10
+            if len(self.price_history) >= 20:
+                medium_trend = (current_price - self.price_history[-20]) / self.price_history[-20] if self.price_history[-20] > 0 else 0
+                medium_trend = np.clip(medium_trend, -0.2, 0.2) * 5
+
+            # Technical indicators (same as in EnhancedTradingEnvironment)
+            # Normalize MACD values
+            macd = indicators.get('MACD_default_macd', 0)
+            macd_signal = indicators.get('MACD_default_signal', 0)
+            macd_hist = indicators.get('MACD_default_histogram', 0)
+            macd_norm = macd / current_price * 100 if current_price > 0 else 0
+            macd_signal_norm = macd_signal / current_price * 100 if current_price > 0 else 0
+            macd_hist_norm = macd_hist / current_price * 100 if current_price > 0 else 0
+            
+            # Explicit position flags (same as in EnhancedTradingEnvironment)
+            has_long = 1.0 if self.position > 0 else 0.0
+            has_short = 1.0 if self.position < 0 else 0.0
+            
+            # Calculate unrealized PnL
+            unrealized_pnl = 0
+            if self.position > 0 and self.long_entry_price > 0:
+                unrealized_pnl = (current_price - self.long_entry_price) / self.long_entry_price
+            elif self.position < 0 and self.short_entry_price > 0:
+                unrealized_pnl = (self.short_entry_price - current_price) / self.short_entry_price
+            unrealized_pnl = np.clip(unrealized_pnl, -0.5, 0.5) * 2
+            
             indicators_list = [
                 indicators.get('RSI_15', 50) / 100 - 0.5,
                 (indicators.get('BB_15_upper', current_price) / current_price - 1) if current_price > 0 else 0,
                 (indicators.get('BB_15_lower', current_price) / current_price - 1) if current_price > 0 else 0,
                 indicators.get('ATR_15', 100) / 1000,
-                indicators.get('OBV', 0) / 1e10,
-                indicators.get('AD', 0) / 1e10,
-                indicators.get('MFI_15', 50) / 100 - 0.5
+                short_trend,  # 5-step price trend (replaced OBV)
+                medium_trend,  # 20-step price trend (replaced AD)
+                indicators.get('MFI_15', 50) / 100 - 0.5,
+                # MACD indicators for trend confirmation
+                np.clip(macd_norm, -1, 1),
+                np.clip(macd_signal_norm, -1, 1),
+                np.clip(macd_hist_norm, -1, 1),
+                # Stochastic oscillator for overbought/oversold
+                indicators.get('Stochastic_slowk', 50) / 100 - 0.5,
+                indicators.get('Stochastic_slowd', 50) / 100 - 0.5,
             ]
 
-            state = np.array([balance_norm, position_norm, price_norm] + indicators_list, dtype=np.float32)
+            # Build state with explicit position flags (same format as EnhancedTradingEnvironment)
+            state = np.array([
+                balance_norm, 
+                position_norm, 
+                price_norm,
+                has_long,  # Explicit flag: 1 if long position open
+                has_short,  # Explicit flag: 1 if short position open
+                unrealized_pnl  # Current unrealized PnL
+            ] + indicators_list, dtype=np.float32)
             return state
 
         except Exception as e:
             logger.error(f"Error creating RL state: {e}")
-            return np.zeros(10, dtype=np.float32)  # Fallback state
+            return np.zeros(18, dtype=np.float32)  # Fallback state (6 base + 12 indicators)
 
     def execute_virtual_trade(self, action, current_price):
         """Execute virtual trade with separate long/short position tracking"""
@@ -1133,7 +1249,9 @@ class RLLiveTradingBot:
             state = self.get_rl_state(indicators, current_price)
 
             # Get action from RL model
-            action, _ = self.model.predict(state, deterministic=True)
+            # Use stochastic sampling to allow exploration of all actions
+            # Deterministic mode always picks the highest probability action (biased to SELL_SHORT)
+            action, _ = self.model.predict(state, deterministic=False)
             if isinstance(action, (np.ndarray, torch.Tensor)):
                 action = int(action.item())
 
@@ -1420,7 +1538,9 @@ class RLLiveTradingBot:
                 state = self.get_rl_state(indicators, current_price)
 
                 # Get action from RL model
-                action, _ = self.model.predict(state, deterministic=True)
+                # Use stochastic sampling to allow exploration of all actions
+                # Deterministic mode always picks the highest probability action (biased to SELL_SHORT)
+                action, _ = self.model.predict(state, deterministic=False)
 
                 # Ensure action is a scalar int
                 if isinstance(action, (np.ndarray, torch.Tensor)):

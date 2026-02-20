@@ -180,7 +180,7 @@ def run_pipeline(data_days, timesteps, max_iterations, min_return, min_sharpe, m
 def main():
     parser = argparse.ArgumentParser(description='Запуск RL Trading Pipeline с автоматической установкой зависимостей')
     parser.add_argument('--data-days', type=int, default=720, help='Количество дней данных (по умолчанию 720)')
-    parser.add_argument('--timesteps', type=int, default=50000, help='Количество шагов обучения (по умолчанию 50000)')
+    parser.add_argument('--timesteps', type=int, default=2000000, help='Количество шагов обучения (по умолчанию 50000)')
     parser.add_argument('--max-iterations', type=int, default=3, help='Максимум итераций (по умолчанию 3)')
     parser.add_argument('--min-return', type=float, default=0.01, help='Минимальная доходность (по умолчанию 0.01, т.е. 1%)')
     parser.add_argument('--min-sharpe', type=float, default=0.3, help='Минимальный коэффициент Шарпа (по умолчанию 0.3)')
