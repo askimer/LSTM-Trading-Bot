@@ -96,18 +96,21 @@ class TradingEnvironment(gym.Env):
         # Actions: 0=Hold, 1=Buy Long, 2=Sell Long, 3=Sell Short, 4=Cover Short
         self.action_space = spaces.Discrete(5)
 
-        # State: [balance_norm, position_norm, price_norm, indicators...]
+        # State: [balance_norm, position_norm, price_norm, time_progress, indicators...]
+        # P1-FIX: Added time_progress for episode end awareness
         n_indicators = 7
         # Use reasonable bounds instead of -inf/inf to prevent NN issues
+        # P1-FIX: Added 4th dimension for time_progress (0.0 to 1.0)
         self.observation_space = spaces.Box(
-            low=np.array([-2.0, -2.5, -15.0] + [-1.0] * n_indicators, dtype=np.float32),
-            high=np.array([2.0, 2.5, 15.0] + [1.0] * n_indicators, dtype=np.float32),
+            low=np.array([-2.0, -2.5, -15.0, 0.0] + [-1.0] * n_indicators, dtype=np.float32),
+            high=np.array([2.0, 2.5, 15.0, 1.0] + [1.0] * n_indicators, dtype=np.float32),
             dtype=np.float32
         )
 
         # Add state normalization parameters
-        self.state_means = np.array([0.0, 0.0, 0.0] + [0.0] * n_indicators, dtype=np.float32)
-        self.state_stds = np.array([1.0, 1.0, 3.0] + [0.5] * n_indicators, dtype=np.float32)
+        # P1-FIX: Added time_progress normalization (mean=0.5, std=0.3)
+        self.state_means = np.array([0.0, 0.0, 0.0, 0.5] + [0.0] * n_indicators, dtype=np.float32)
+        self.state_stds = np.array([1.0, 1.0, 3.0, 0.3] + [0.5] * n_indicators, dtype=np.float32)
 
         self.reset()
 
@@ -320,9 +323,24 @@ class TradingEnvironment(gym.Env):
             mfi / 100 - 0.5  # MFI normalized to [-0.5, 0.5]
         ]
 
-        state = np.array([balance_norm, position_norm, price_norm] + indicators, dtype=np.float32)
-        # Protect against NaN and inf values that could break the neural network
-        state = np.nan_to_num(state, nan=0.0, posinf=5.0, neginf=-5.0)
+        # P1-FIX: Add time_progress for episode end awareness
+        # Model needs to know when episode is ending to make better decisions
+        time_progress = self.steps_in_episode / self.episode_length if self.episode_length > 0 else 0.0
+        time_progress = np.clip(time_progress, 0.0, 1.0)  # Ensure bounds [0, 1]
+
+        state = np.array([balance_norm, position_norm, price_norm, time_progress] + indicators, dtype=np.float32)
+        
+        # P0-FIX: Validate state vector for NaN/inf before returning
+        # This prevents neural network corruption from invalid inputs
+        if np.isnan(state).any() or np.isinf(state).any():
+            self.logger.warning(f"P0-FIX: Invalid state detected at step {self.current_step}: "
+                               f"nan_count={np.isnan(state).sum()}, inf_count={np.isinf(state).sum()}, "
+                               f"state={state}")
+            # Replace NaN with 0.0, inf with clipped values
+            state = np.nan_to_num(state, nan=0.0, posinf=1.0, neginf=-1.0)
+            # Additional clipping to safe bounds
+            state = np.clip(state, -10.0, 10.0)
+        
         # Additional safety: clip to observation space bounds to ensure numerical stability
         state = np.clip(state, self.observation_space.low, self.observation_space.high)
         return state

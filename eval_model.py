@@ -7,7 +7,7 @@ import sys
 from stable_baselines3 import PPO
 from enhanced_trading_environment import EnhancedTradingEnvironment
 
-model = PPO.load('ppo_trading_agent.zip')
+model = PPO.load('rl_checkpoints_profitable/ppo_profitable_250000_steps.zip')
 
 data_file = 'btc_usdt_training_data/full_btc_usdt_data_feature_engineered.csv'
 
@@ -49,7 +49,7 @@ for ep in range(4):
 
     while not done and step < 300:
         step += 1
-        action, _ = model.predict(state, deterministic=False)
+        action, _ = model.predict(state, deterministic=False)  # P3-FIX: Use stochastic for exploration
         action = int(action); ac[action] += 1
         state, _, terminated, truncated, info = env.step(action)
         done = terminated or truncated

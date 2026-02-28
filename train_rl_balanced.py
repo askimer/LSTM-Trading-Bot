@@ -544,13 +544,9 @@ def preprocess_data(df, scaler=None, fit_scaler=True):
     print(f"Preprocessing complete: {len(df)} final rows")
     return df, None
 
-def train_rl_agent(data_path, total_timesteps=200000, eval_freq=10000, n_envs=8, train_test_split=0.8):
+def train_rl_agent(data_path, total_timesteps=1000000, eval_freq=10000, n_envs=8, train_test_split=0.8):
     """
     Train RL agent using PPO with parallel environments
-
-    БЕЗ утечки данных: данные разделяются на train/test по времени,
-    скейлер обучается только на train данных.
-
     Recommendations for timesteps:
     - Quick testing: 50,000 - 100,000 steps
     - Development: 200,000 - 500,000 steps
@@ -662,36 +658,37 @@ def train_rl_agent(data_path, total_timesteps=200000, eval_freq=10000, n_envs=8,
     print("✅ VecNormalize applied: norm_obs=False (ручная норм. в _get_state), norm_reward=True")
 
     print("Creating PPO model...")
-    # FIX v3: Profit-optimized PPO parameters
+    # FIX v5: Optimized PPO parameters for better convergence
     # Key changes for profitable trading:
-    # - learning_rate: 3e-5 → 1e-5 (more stable convergence)
-    # - ent_coef: 0.05 → 0.1 (more exploration for profit opportunities)
-    # - clip_range: 0.1 → 0.15 (slightly larger updates)
-    # - batch_size: 256 → 512 (better gradient estimation)
-    # - n_epochs: 5 → 8 (more training per batch)
-    # - max_grad_norm: 0.5 → 0.3 (stronger gradient clipping)
+    # - learning_rate: 1e-5 → 3e-4 (standard PPO value)
+    # - ent_coef: 0.1 → get_linear_fn(0.05, 0.01) with decay
+    # - clip_range: 0.15 (kept)
+    # - batch_size: 512 → 2048 (better gradient estimation)
+    # - n_epochs: 8 → 4 (prevent overfitting)
+    # - gamma: 0.99 → 0.95 (shorter-term focus for intraday)
+    # - max_grad_norm: 0.3 (kept)
+    # - network: [256,128] → [512,256,128] (more capacity)
     model = PPO(
         "MlpPolicy",
         env,
-        learning_rate=1e-5,        # Reduced for stable profit learning
+        learning_rate=3e-4,        # Standard PPO value for faster learning
         n_steps=2048,
-        batch_size=512,            # Larger batch for better gradient estimation
-        n_epochs=8,                # More epochs per update
-        gamma=0.99,
+        batch_size=2048,            # Larger batch for better gradients
+        n_epochs=4,                # Reduce to prevent overfitting
+        gamma=0.95,               # Shorter-term focus
         gae_lambda=0.95,
         clip_range=0.15,           # Slightly larger for profit exploration
-        ent_coef=0.1,              # Higher entropy for profit opportunity exploration
+        ent_coef=0.03,             # Fixed entropy coefficient for balanced exploration/exploitation
         vf_coef=0.5,
-        max_grad_norm=0.3,         # Stronger gradient clipping to prevent NaN
+        max_grad_norm=0.5,         # P2-FIX: gradient clipping to prevent exploding gradients
         verbose=0,
         tensorboard_log="./rl_tensorboard/",
         policy_kwargs=dict(
-            net_arch=dict(pi=[256, 128], vf=[256, 128]),
-            activation_fn=torch.nn.Tanh,  # Tanh stable with VecNormalize
+            net_arch=dict(pi=[1024, 512, 256], vf=[1024, 512, 256]),  # P2-FIX: was [512, 256, 128], increased for 18+ dim state
+            activation_fn=torch.nn.ReLU,  # ReLU for faster convergence
             ortho_init=True,
         )
     )
-
     # Enhanced TensorBoard callback for comprehensive monitoring
     class EnhancedTensorBoardCallback(BaseCallback):
         """Enhanced callback for comprehensive TensorBoard logging"""
@@ -1247,7 +1244,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train RL Trading Agent")
     parser.add_argument("--data", default="btc_usdt_training_data/full_btc_usdt_data_feature_engineered.csv",
                        help="Path to training data")
-    parser.add_argument("--timesteps", type=int, default=500000,
+    # P0-FIX: Increased from 500000 to 1000000 for more PPO updates
+    # Calculation: 1M / (2048 * 8) = 61 PPO updates (was ~30 with 500K)
+    # More updates = better policy convergence
+    parser.add_argument("--timesteps", type=int, default=1000000,
                        help="Total training timesteps")
     parser.add_argument("--n_envs", type=int, default=8,
                        help="Number of parallel environments")

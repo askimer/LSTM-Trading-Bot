@@ -26,7 +26,7 @@ from datetime import datetime, timedelta
 import numpy as np
 import pandas as pd
 import torch
-from stable_baselines3 import PPO
+from stable_baselines3 import DQN  # V19.3-FIX: Use DQN instead of PPO
 
 # ──────────────────────────────────────────────────────────────────────────────
 # UTF-8 для Windows
@@ -51,8 +51,9 @@ logger = logging.getLogger(__name__)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Import trading environment (must match training exactly)
+# V19.3-FIX: Use enhanced_trading_environment_v19 with corrected settings
 # ──────────────────────────────────────────────────────────────────────────────
-from enhanced_trading_environment import EnhancedTradingEnvironment
+from enhanced_trading_environment_v19 import EnhancedTradingEnvironment
 
 # Action mapping
 ACTION_NAMES = {0: 'HOLD', 1: 'BUY_LONG', 2: 'SELL_LONG', 3: 'SELL_SHORT', 4: 'COVER_SHORT'}
@@ -69,7 +70,7 @@ def run_paper_trading(model_path: str, data_path: str, initial_balance: float = 
     Uses EnhancedTradingEnvironment directly — exact same setup as training.
 
     Args:
-        model_path: Path to trained PPO model (.zip)
+        model_path: Path to trained DQN model (.zip)
         data_path:  Path to CSV with OHLCV + indicators
         initial_balance: Starting balance in USD
         n_episodes: Number of independent episodes to run
@@ -82,7 +83,7 @@ def run_paper_trading(model_path: str, data_path: str, initial_balance: float = 
     # Load model
     print(f"Loading model: {model_path}")
     try:
-        model = PPO.load(model_path)
+        model = DQN.load(model_path)  # V19.3-FIX: Use DQN
         print("✅ Model loaded")
     except Exception as e:
         logger.error(f"Failed to load model: {e}")
@@ -115,17 +116,21 @@ def run_paper_trading(model_path: str, data_path: str, initial_balance: float = 
         print(f"\n{'─' * 50}")
         print(f"Episode {episode + 1}/{n_episodes}")
 
+        # V19.3-FIX: Use same settings as training for fair evaluation
+        # Use last 3001 rows (test data) with episode_length=300
+        test_df = df.tail(3001).copy()
+        
         env = EnhancedTradingEnvironment(
-            df=df,
+            df=test_df,
             initial_balance=initial_balance,
             transaction_fee=0.0018,
-            episode_length=len(df),
+            episode_length=300,  # V19.3: Same as training
             start_step=0,
             debug=False,
-            enable_strategy_balancing=False  # No balancing needed in evaluation
+            enable_strategy_balancing=True  # V19.3: Same as training
         )
 
-        result = _run_episode(env, model, df, initial_balance, verbose=verbose)
+        result = _run_episode(env, model, test_df, initial_balance, verbose=verbose)
         all_results.append(result)
         _print_episode_summary(result, episode + 1)
 
@@ -142,7 +147,7 @@ def run_paper_trading(model_path: str, data_path: str, initial_balance: float = 
     return all_results if n_episodes > 1 else all_results[0]
 
 
-def _run_episode(env: EnhancedTradingEnvironment, model: PPO, df: pd.DataFrame,
+def _run_episode(env: EnhancedTradingEnvironment, model: DQN, df: pd.DataFrame,
                  initial_balance: float, verbose: bool = True) -> dict:
     """Run a single paper trading episode and return results."""
     state, _ = env.reset()
@@ -158,8 +163,8 @@ def _run_episode(env: EnhancedTradingEnvironment, model: PPO, df: pd.DataFrame,
         price_idx = min(env.current_step, len(df) - 1)
         current_price = df.iloc[price_idx].get('close', df.iloc[price_idx].get('Close', 0))
 
-        # Predict action (stochastic for exploration)
-        action, _ = model.predict(state, deterministic=False)
+        # Predict action (V19.3-FIX: Use DQN deterministic prediction)
+        action, _ = model.predict(state, deterministic=True)
         action = int(action)
         action_counts[action] = action_counts.get(action, 0) + 1
 
@@ -268,12 +273,16 @@ class TradingBot:
       - SELL_LONG (2): closes long, BLOCKED if no long
       - SELL_SHORT (3): opens short, BLOCKED if long is open
       - COVER_SHORT (4): closes short, BLOCKED if no short
+    
+    V19.3-FIX: Parameters match training configuration
     """
 
     TRANSACTION_FEE = 0.0018  # 0.18% (matches training)
     MARGIN_REQUIREMENT = 0.3   # 30% margin for shorts
     TRAILING_STOP_PCT = 0.05   # 5% trailing stop
-    BASE_POSITION_SIZE = 0.08  # 8% of balance per trade
+    BASE_POSITION_SIZE = 0.10  # V19.3: 10% of balance per trade (matches training)
+    MIN_HOLD_STEPS = 3  # V19.3: Minimum steps before closing (matches training)
+    MIN_OPEN_COOLDOWN = 3  # V19.3: Cooldown between trades (matches training)
 
     def __init__(self, model_path: str, symbol: str = 'BTC-USDT',
                  initial_balance: float = 10000, mode: str = 'live'):
@@ -281,9 +290,9 @@ class TradingBot:
         self.initial_balance = initial_balance
         self.mode = mode  # 'live' or 'real'
 
-        # Load model
+        # Load model - V19.3-FIX: Use DQN instead of PPO
         logger.info(f"Loading model: {model_path}")
-        self.model = PPO.load(model_path)
+        self.model = DQN.load(model_path)
         logger.info("✅ Model loaded")
 
         # Exchange connection
@@ -534,7 +543,10 @@ class TradingBot:
         Returns True if the trade was executed.
         """
         now = time.time()
-        if now - self.last_trade_time < self.min_trade_interval and self.last_trade_time > 0:
+        
+        # V19.3-FIX: Check cooldown between trades (in seconds, matches training steps)
+        # Training: min_open_cooldown=3 steps ≈ 3 minutes in live trading
+        if now - self.last_trade_time < 180 and self.last_trade_time > 0:  # 3 minutes
             return False
 
         if self.mode == 'real':
@@ -603,6 +615,12 @@ class TradingBot:
             logger.debug("SELL_LONG blocked: no long position")
             return False, None
 
+        # V19.3-FIX: Check minimum hold steps (matches training)
+        steps_held = self.step_counter - self.entry_step
+        if steps_held < self.MIN_HOLD_STEPS:
+            logger.debug(f"SELL_LONG blocked: held {steps_held} < {self.MIN_HOLD_STEPS} steps")
+            return False, None
+
         revenue = self.position * price
         fee = self._fee(revenue)
         pnl = revenue - (self.position * self.entry_price) - fee
@@ -651,6 +669,12 @@ class TradingBot:
         """Close short position."""
         if self.position >= 0:
             logger.debug("COVER_SHORT blocked: no short position")
+            return False, None
+
+        # V19.3-FIX: Check minimum hold steps (matches training)
+        steps_held = self.step_counter - self.entry_step
+        if steps_held < self.MIN_HOLD_STEPS:
+            logger.debug(f"COVER_SHORT blocked: held {steps_held} < {self.MIN_HOLD_STEPS} steps")
             return False, None
 
         size = abs(self.position)
@@ -802,17 +826,13 @@ class TradingBot:
                 # Check trailing stop BEFORE model decision
                 self._check_trailing_stop(current_price)
 
-                # Get state and model prediction
+                # Get state and model prediction - V19.3-FIX: Use deterministic=True
                 state = self.get_state()
-                action, _ = self.model.predict(state, deterministic=False)
+                action, _ = self.model.predict(state, deterministic=True)
                 action = int(action)
 
-                # Log action probabilities
-                state_t = torch.tensor(state.reshape(1, -1), dtype=torch.float32)
-                dist = self.model.policy.get_distribution(state_t)
-                probs = dist.distribution.probs[0].detach().numpy()
-                prob_str = '  '.join(f"{ACTION_NAMES[i]}={probs[i]:.3f}" for i in range(5))
-                logger.info(f"${current_price:,.2f}  {prob_str}  → {ACTION_NAMES[action]}")
+                # Log action
+                logger.info(f"${current_price:,.2f} → {ACTION_NAMES[action]}")
 
                 # Execute
                 self.execute_trade(action, current_price)
@@ -954,8 +974,8 @@ Examples:
                             help='⚠️  Real trading (NOT YET IMPLEMENTED)')
 
     # Common args
-    parser.add_argument('--model', default='ppo_trading_agent.zip',
-                        help='Path to trained PPO model (default: ppo_trading_agent.zip)')
+    parser.add_argument('--model', default='rl_checkpoints_v19_dqn_fixed/dqn_v19_best.zip',
+                        help='Path to trained DQN model (default: rl_checkpoints_v19_dqn_fixed/dqn_v19_best.zip)')
     parser.add_argument('--symbol', default='BTC-USDT',
                         help='Trading symbol (default: BTC-USDT)')
     parser.add_argument('--balance', type=float, default=10000,
@@ -967,7 +987,7 @@ Examples:
                         help='Path to historical CSV data (for --paper mode)')
     parser.add_argument('--episodes', type=int, default=1,
                         help='Number of episodes to run (for --paper mode, default: 1)')
-    parser.add_argument('--verbose', action='store_true', default=True,
+    parser.add_argument('--verbose', action='store_false', default=True,
                         help='Verbose step output (paper mode)')
 
     # Live/real args

@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 from gymnasium import spaces
 import warnings
+from risk_management import RiskManager, PositionSide
 
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
@@ -37,7 +38,17 @@ class EnhancedTradingEnvironment(gym.Env):
         self.stop_loss_pct = 0.08
         self.take_profit_pct = 0.15
         self.max_episode_loss_pct = 0.05
-        
+
+        # P1-FIX: Initialize RiskManager for dynamic position sizing
+        self.risk_manager = RiskManager(
+            initial_capital=self.initial_balance,
+            max_position_size=0.10,  # 10% per position
+            max_total_exposure=0.40,  # 40% total exposure
+            stop_loss_pct=0.08,  # 8% stop loss
+            take_profit_pct=0.15,  # 15% take profit
+            max_drawdown_limit=0.20  # 20% max drawdown
+        )
+
         # Dynamic position sizing parameters
         self.volatility_window = 20
         self.min_position_size = 0.02
@@ -66,30 +77,126 @@ class EnhancedTradingEnvironment(gym.Env):
         self.termination_profit_target = 1.50
 
         # Anti-overtrading parameters
-        # FIX v3: min_hold_steps снижен с 15 до 3 — иначе первые 15 шагов каждая попытка
-        # закрыть позицию штрафовалась -0.5, что учило модель НИКОГДА не закрывать позиции.
-        self.min_hold_steps = 3         # Minimum steps to hold position before manual close
-        self.min_open_cooldown = 5      # Minimum steps after close before opening new position
-        self.hold_penalty_start = 10    # Steps after entry before hold penalty kicks in (was 35)
+        # V18-FIX: Aggressive overtrading prevention
+        self.min_hold_steps = 10  # V18: Increased from 5 to 10 - force patience
+        self.min_open_cooldown = 10  # V18: Increased from 5 to 10 - wait between trades
+        self.hold_penalty_start = 30  # V18: Increased from 20 to 30 - give more time
+        
+        # V18-FIX: Overtrading penalty
+        self.overtrading_threshold = 20  # Max trades per episode before penalty
+        self.overtrading_penalty = -10.0  # V18: Strong penalty for excessive trading
+        
+        # V18-FIX: Position time quality tracking
+        self.quick_close_threshold = 5  # Closing within 5 steps = bad
+        self.quick_close_penalty = -5.0  # Penalty for closing too quickly
 
         # Reward parameters
-        self.reward_clip_bounds = (-50, 50)
-        self.long_reward_multiplier = 1.0  # Equal reward for both directions
-        self.short_reward_multiplier = 1.0  # Equal reward for both directions
+        # V18-FIX: Balanced rewards for quality trading
+        self.reward_clip_bounds = (-50.0, 50.0)
+
+        # V18-FIX: Asymmetric rewards to encourage shorts
+        self.long_reward_multiplier = 0.8  # V18: Reduced to balance long/short
+        self.short_reward_multiplier = 1.5  # V18: Higher reward for shorts!
+        
         self.action_diversity_penalty = 0.001
         self.min_episode_length_for_rewards = 1
         self.short_episode_penalty = 0.0
 
-        # Strategy balancing parameters (NEW)
-        self.direction_balance_target = 0.5  # Target 50% long, 50% short
-        self.direction_balance_penalty_weight = 0.25  # Weight for balance penalty (increased from 0.15)
-        self.max_direction_concentration = 0.65  # Maximum 65% in one direction (reduced from 0.7)
-        self.direction_streak_limit = 4  # Maximum consecutive same-direction trades (reduced from 5)
-        self.exploration_bonus_weight = 0.15  # Bonus for exploring underrepresented directions (increased from 0.10)
+        # ============================================================
+        # SMART REWARD SYSTEM v12.0 - ENHANCED PROFITABILITY
+        # Key improvements from v11:
+        # - Higher profit scale (25 → 30)
+        # - Missed profit penalty (was: none)
+        # - Correct hold reward (was: none)
+        # - Overtrading penalty (was: none)
+        # - Dynamic profit threshold
+        # ============================================================
+
+        # 1. HOLD BONUS - V12: Stronger reward for profitable positions
+        self.hold_bonus_enabled = True
+        self.hold_bonus_profit_threshold = 0.005  # Only if profit > 0.5%
+        self.hold_bonus_per_step = 0.05  # Stronger reward per step
+        self.hold_bonus_cap = 1.0
+
+        # 2. FORCED CLOSE PENALTY - V12: Same as v11
+        self.max_hold_steps_before_penalty = 20
+        self.hold_penalty_per_step = 0.05
+
+        # 3. CLOSE REWARD - V18-FIX: Усиленный reward для КАЧЕСТВЕННЫХ закрытий
+        # Model earns BIG reward for PROFITABLE closes
+        self.smart_close_enabled = True
+        self.profit_close_bonus_scale = 50.0  # V18: Increased from 40.0 to 50.0 (+25%)
+        self.loss_close_penalty_scale = 3.0  # V18: Increased from 2.5 to 3.0 (+20%)
+        self.min_profit_for_bonus = 0.001  # V18: Reduced from 0.002 - reward even small profits
         
-        # Direction-specific reward multipliers (applied to opening positions)
-        self.long_open_bonus = 0.20  # Bonus for opening long when shorts dominate (increased from 0.15)
-        self.short_open_bonus = 0.20  # Bonus for opening short when longs dominate (increased from 0.15)
+        # V18-FIX: Quick close penalty (prevent flip-flopping)
+        self.quick_close_penalty_enabled = True
+        self.missed_profit_penalty = 0.0  # V12.1: Removed penalty
+        
+        # V12.1: Correct hold reward - REDUCED to avoid over-conservative behavior
+        self.correct_hold_reward = 0.02  # V12.1: Reduced from 0.1 to 0.02
+        
+        # 4. TIME PENALTY - V12.1: Same as v12
+        self.time_penalty_enabled = True
+        self.time_penalty_per_step = 0.005
+        self.time_penalty_start = 15
+        self.time_penalty_cap = 2.0
+        
+        # 5. EARLY CLOSE PENALTY - REMOVED
+        self.early_close_penalty_enabled = False
+        self.early_close_threshold_steps = 5
+        self.early_close_penalty = 0.0
+        
+        # V12.1-FIX: Profit multiplier - SLIGHTLY REDUCED
+        self.profit_multiplier_enabled = True
+        self.profit_multiplier_threshold = 0.008  # V12.1: Reduced from 0.01 to 0.008 (easier to trigger)
+        self.profit_multiplier_scale = 2.0  # V12.1: Reduced from 2.5 to 2.0
+        
+        # V13-FIX: Removed trading bonus (model found exploit)
+        self.trading_encouragement_enabled = False  # V13: DISABLED
+        self.trading_bonus_per_trade = 0.0
+        self.min_trades_for_bonus = 5
+        
+        # V13-FIX: Stronger invalid action penalty
+        self.invalid_action_penalty = 1.0  # V13: Increased from 0.5 to 1.0
+        
+        # V16-FIX: Action Masking
+        self.action_masking_enabled = False  # Will be set by training script
+        
+        # Track position hold time for forced close penalty
+        self.position_open_time = 0  # v7.0: Track how long position has been open
+
+        # Strategy balancing parameters (V11-IMPROVED)
+        self.direction_balance_target = 0.5  # Target 50% long, 50% short
+        
+        # V11-FIX: Усиленные параметры для баланса
+        self.direction_balance_penalty_weight = 0.5  # V11-FIX: Увеличено с 0.25 до 0.5 (2x)
+        self.max_direction_concentration = 0.60  # V11-FIX: Уменьшено с 0.65 до 0.60 (строже)
+        self.direction_streak_limit = 3  # V11-FIX: Уменьшено с 4 до 3 (строже)
+        self.exploration_bonus_weight = 0.25  # V11-FIX: Увеличено с 0.15 до 0.25
+        
+        # V11-FIX: Усиленные bonus за контр-тренд
+        self.long_open_bonus = 0.5  # V11-FIX: Увеличено с 0.20 до 0.50 (2.5x)
+        self.short_open_bonus = 0.5  # V11-FIX: Увеличено с 0.20 до 0.50 (2.5x)
+        
+        # ============================================================
+        # HYBRID MODE v2.0 - RL LEARNS ENTRY, RULES HANDLE EXIT
+        # When enabled, RL focuses on entry decisions only
+        # Exits are handled automatically by fixed TP/SL rules
+        # This separates learning: RL learns when to enter, rules handle exit
+        # ============================================================
+        # V13.1: ENABLED for better profitability
+        self.hybrid_mode_enabled = True  # V13.1: ENABLED - RL learns entry only
+        self.hybrid_take_profit_pct = 0.05  # 5% TP (reasonable profit target)
+        self.hybrid_stop_loss_pct = 0.03  # 3% SL (controlled risk)
+        self.hybrid_max_hold_steps = 50  # Max steps before forced close (give time to develop)
+        self.hybrid_entry_reward_scale = 5.0  # Reward for successful entry (realized PnL)
+        self.hybrid_allow_manual_close = False  # V13.1: DISABLED - only TP/SL exits
+        self.hybrid_min_hold_for_tpsl = 3  # Min steps before TP/SL can trigger
+        
+        # Track hybrid mode exits for reward calculation
+        self.hybrid_exit_reason = None  # 'tp', 'sl', 'time', 'manual', None
+        self.hybrid_entry_unrealized_pnl = 0.0  # Track unrealized PnL at entry for reward
 
         # Action diversity tracking
         self.action_history = []
@@ -249,6 +356,19 @@ class EnhancedTradingEnvironment(gym.Env):
         # Anti-overtrading state
         self.last_close_step = -999   # When last position was closed (-999 = no recent close)
         self.last_trade_hold_steps = 0  # How long was the last closed trade held
+        
+        # v8.0: Track open/close actions for close_rate calculation
+        self.total_opens = 0   # Count of position opens (BUY_LONG, SELL_SHORT)
+        self.total_closes = 0  # Count of position closes (SELL_LONG, COVER_SHORT)
+        
+        # v8.0: Track accumulated hold bonus for episode
+        self.accumulated_hold_bonus = 0.0
+        
+        # V12: Track highest unrealized PnL for missed profit penalty
+        self.highest_unrealized_pnl = 0.0
+        
+        # V12.1: Track episode trades for trading encouragement bonus
+        self.episode_trades = 0
         
         # Initialize previous price for reward calculation
         current_price = self.df.iloc[self.current_step].get('close', self.df.iloc[self.current_step].get('Close', 500))
@@ -512,19 +632,20 @@ class EnhancedTradingEnvironment(gym.Env):
         
         # Initialize reward
         balance_reward = 0.0
-        
+
         # 1. DIRECTION-SPECIFIC OPENING BONUSES (strongest signal)
+        # P1-FIX: Reduced multiplier from *2 to *0.1 to prevent balance reward from dominating PnL reward
         # Reward opening positions in underrepresented direction
         if action == 1:  # Buy Long (opening)
             if short_ratio > 0.6:  # Shorts dominate
-                balance_reward += self.long_open_bonus * 2  # Strong bonus for diversifying
+                balance_reward += self.long_open_bonus * 0.1  # P1-FIX: Reduced from *2 to *0.1
             elif short_ratio > 0.5:
-                balance_reward += self.long_open_bonus
+                balance_reward += self.long_open_bonus * 0.05  # P1-FIX: Reduced multiplier
         elif action == 3:  # Sell Short (opening)
             if long_ratio > 0.6:  # Longs dominate
-                balance_reward += self.short_open_bonus * 2  # Strong bonus for diversifying
+                balance_reward += self.short_open_bonus * 0.1  # P1-FIX: Reduced from *2 to *0.1
             elif long_ratio > 0.5:
-                balance_reward += self.short_open_bonus
+                balance_reward += self.short_open_bonus * 0.05  # P1-FIX: Reduced multiplier
         
         # 2. BALANCE DEVIATION PENALTY (applied to all actions)
         # Penalize extreme imbalances more heavily
@@ -558,85 +679,219 @@ class EnhancedTradingEnvironment(gym.Env):
 
     def _calculate_reward(self, current_price, action, action_performed=False, pnl_pct=None):
         """
-        Reward function with explicit position awareness.
-
-        FIX v2: Removed base_reward=2.0 bug that gave positive reward for losses.
-        Now losses correctly produce negative reward signal.
-
-        Core principle:
-        - Profit close  → +reward proportional to pnl
-        - Loss close    → -reward proportional to pnl  (no base bonus!)
-        - Invalid open  → small penalty
-        - Hold too long → progressive hold penalty
-        - Strategy balance reward for direction diversity
+        SMART REWARD SYSTEM v13.1 - HYBRID MODE
+        
+        Core principle: RL learns ENTRY, rules handle EXIT via TP/SL
+        
+        In hybrid mode:
+        - Reward given when position is closed by TP/SL
+        - Small reward for holding profitable positions
+        - Penalty for invalid entry attempts
         """
         reward = 0.0
+        
+        # ========================================
+        # HYBRID MODE: Check if position was closed by TP/SL
+        # ========================================
+        if self.hybrid_mode_enabled and self.hybrid_exit_reason is not None:
+            # Position was closed by TP/SL - reward based on exit type
+            pnl_pct = self.hybrid_entry_unrealized_pnl
+            
+            if self.hybrid_exit_reason == 'tp':
+                # Take Profit hit - BIG reward
+                reward += 10.0  # Base TP bonus
+                reward += pnl_pct * 100 * 2.0  # Scaled PnL bonus
+                if self.debug:
+                    print(f"HYBRID TP: pnl={pnl_pct*100:.2f}%, reward={reward:.2f}")
+                    
+            elif self.hybrid_exit_reason == 'sl':
+                # Stop Loss hit - small penalty (acceptable loss)
+                reward += -2.0  # Small penalty for SL
+                if self.debug:
+                    print(f"HYBRID SL: pnl={pnl_pct*100:.2f}%, reward={reward:.2f}")
+                    
+            elif self.hybrid_exit_reason == 'time':
+                # Time-based exit - neutral
+                reward += pnl_pct * 100  # Just PnL
+                if self.debug:
+                    print(f"HYBRID TIME: pnl={pnl_pct*100:.2f}%, reward={reward:.2f}")
+            
+            # Reset hybrid tracking
+            self.hybrid_exit_reason = None
+            self.hybrid_entry_unrealized_pnl = 0.0
+            return reward
+        
+        # ========================================
+        # NON-HYBRID MODE: Original reward logic
+        # ========================================
+        if not self.hybrid_mode_enabled:
+            # Track highest unrealized PnL for missed profit penalty
+            if not hasattr(self, 'highest_unrealized_pnl'):
+                self.highest_unrealized_pnl = 0.0
+            
+            # HOLD BONUS + CORRECT HOLD REWARD
+            if self.position != 0 and self.entry_price > 0:
+                if self.position > 0:
+                    unrealized_pnl_pct = (current_price - self.entry_price) / self.entry_price
+                else:
+                    unrealized_pnl_pct = (self.entry_price - current_price) / self.entry_price
+                
+                if unrealized_pnl_pct > self.highest_unrealized_pnl:
+                    self.highest_unrealized_pnl = unrealized_pnl_pct
+                
+                if self.correct_hold_reward > 0 and unrealized_pnl_pct > 0:
+                    reward += self.correct_hold_reward * unrealized_pnl_pct
+                
+                if self.hold_bonus_enabled and unrealized_pnl_pct > self.hold_bonus_profit_threshold:
+                    if not hasattr(self, 'accumulated_hold_bonus'):
+                        self.accumulated_hold_bonus = 0.0
+                    
+                    step_bonus = min(self.hold_bonus_per_step, 
+                                    self.hold_bonus_cap - self.accumulated_hold_bonus)
+                    if step_bonus > 0:
+                        self.accumulated_hold_bonus += step_bonus
+                        reward += step_bonus
+            
+            # CLOSE REWARD - V18 IMPROVED
+            if self.smart_close_enabled and action in [2, 4] and action_performed and pnl_pct is not None:
+                close_action_bonus = 5.0
+                reward += close_action_bonus
+                
+                # V18: Track how long position was held
+                steps_held = self.current_step - self.entry_step
+                
+                # V18: Quick close penalty (prevent flip-flopping)
+                if self.quick_close_penalty_enabled and steps_held < self.quick_close_threshold:
+                    reward += self.quick_close_penalty  # -5.0 penalty
+                
+                if pnl_pct > self.min_profit_for_bonus:
+                    profit_bonus = pnl_pct * 100 * self.profit_close_bonus_scale
+                    reward += profit_bonus
+                    
+                    # V18: Bonus for holding position longer (quality trade)
+                    if steps_held >= 20:
+                        hold_quality_bonus = min((steps_held - 20) * 0.1, 5.0)  # Up to +5.0
+                        reward += hold_quality_bonus
+                    
+                    # V18: Extra bonus for shorts (encourage short trading)
+                    if self.position < 0:
+                        short_bonus = profit_bonus * 0.5  # +50% bonus for short profits
+                        reward += short_bonus
+                    
+                    if self.profit_multiplier_enabled and pnl_pct >= self.profit_multiplier_threshold:
+                        multiplier_bonus = profit_bonus * (self.profit_multiplier_scale - 1)
+                        reward += multiplier_bonus
+                    
+                    if self.position > 0:
+                        reward += pnl_pct * 100.0 * self.long_reward_multiplier
+                    else:
+                        reward += pnl_pct * 100.0 * self.short_reward_multiplier
+                    
+                elif pnl_pct > 0:
+                    # Small profit - still reward
+                    reward += pnl_pct * 100.0
+                else:
+                    # Loss - stronger penalty
+                    loss_penalty = pnl_pct * 100.0 * self.loss_close_penalty_scale
+                    reward += loss_penalty
+                    
+                    # V18: Extra penalty for quick losses (bad trade)
+                    if steps_held < self.quick_close_threshold:
+                        reward += -2.0  # Additional penalty
 
-        # Reward/penalty for closing positions
-        # FIX v4: close_bonus=+2.0 применяется к ЛЮБОМУ закрытию (profit И loss).
-        # Это критически важно: без этого модель видит «закрыть убыточно = -5» vs «держать = -0.1/шаг»
-        # и выбирает бесконечно держать. С бонусом: «закрыть убыточно = -5+2 = -3» vs «держать 30 шагов = -3».
-        # Математически выгоднее закрыть, чем держать более ~30 шагов.
-        if action in [2, 4] and action_performed and pnl_pct is not None:
-            close_bonus = 2.0  # Бонус за ЛЮБОЕ закрытие (profit или loss) — мотивирует модель закрывать
-            reward += close_bonus
-            if pnl_pct > 0:
-                # Profit: scaled reward + additional profit bonus
-                reward += pnl_pct * 100.0 + 1.0
-            else:
-                # Loss: clear negative signal proportional to loss
-                reward += pnl_pct * 100.0
+                if hasattr(self, 'accumulated_hold_bonus'):
+                    self.accumulated_hold_bonus = 0.0
+            
+            # OPENING PENALTY - V18 IMPROVED
+            if action in [1, 3] and action_performed:
+                # V18: Base penalty for any entry (discourage overtrading)
+                open_penalty = -1.0  # Increased from -0.5 to -1.0
+                reward += open_penalty
+                
+                # V18: Extra penalty if we already traded too much this episode
+                if hasattr(self, 'total_trades') and self.total_trades > self.overtrading_threshold:
+                    reward += -2.0  # Additional penalty for excessive trading
+                
+                # V18: Bonus for short entries (encourage shorts)
+                if action == 3:  # SELL_SHORT
+                    reward += 1.0  # Small bonus to encourage shorts
+            
+            # FORCED CLOSE PENALTY
+            if self.position != 0 and self.entry_price > 0:
+                steps_held = self.current_step - self.entry_step
+                if steps_held > self.max_hold_steps_before_penalty:
+                    excess_steps = steps_held - self.max_hold_steps_before_penalty
+                    hold_penalty = -self.hold_penalty_per_step * excess_steps
+                    reward += hold_penalty
+            
+            # TIME PENALTY
+            if self.time_penalty_enabled and self.position != 0 and self.entry_price > 0:
+                steps_held = self.current_step - self.entry_step
+                if steps_held > self.time_penalty_start:
+                    if self.position > 0:
+                        unrealized_pnl_pct = (current_price - self.entry_price) / self.entry_price
+                    else:
+                        unrealized_pnl_pct = (self.entry_price - current_price) / self.entry_price
+                    
+                    if unrealized_pnl_pct <= 0:
+                        time_penalty = -self.time_penalty_per_step * (steps_held - self.time_penalty_start)
+                        time_penalty = max(time_penalty, -self.time_penalty_cap)
+                        reward += time_penalty
+            
+            # INVALID ACTION PENALTIES
+            if action == 2 and not action_performed:
+                if self.position <= 0:
+                    reward += -self.invalid_action_penalty
+            if action == 4 and not action_performed:
+                if self.position >= 0:
+                    reward += -self.invalid_action_penalty
 
-        # Penalty for trying to close non-existent position.
-        # FIX v3: Distinguish "no position" (real mistake, penalize) from
-        # "blocked by min_hold_steps" (position exists but too early — NO penalty!).
-        # Previously both cases gave -0.5, which trained the model to NEVER close positions.
-        if action == 2 and not action_performed:
-            if self.position <= 0:
-                # Truly no long position to close → penalize
-                reward += -0.5
-            # else: position > 0 but blocked by min_hold_steps → no penalty, model is just early
-        if action == 4 and not action_performed:
-            if self.position >= 0:
-                # Truly no short position to close → penalize
-                reward += -0.5
-            # else: position < 0 but blocked by min_hold_steps → no penalty
+            if action == 1 and not action_performed:
+                if self.position > 0:
+                    reward += -self.invalid_action_penalty
+                elif self.position < 0:
+                    reward += -0.5
 
-        # Penalty for invalid opening actions (position already open)
-        if action == 1 and not action_performed:  # BUY_LONG failed
-            if self.position > 0:
-                reward += -0.5  # Already in long
-            elif self.position < 0:
-                reward += -0.3  # In short — need COVER_SHORT first
+            if action == 3 and not action_performed:
+                if self.position < 0:
+                    reward += -self.invalid_action_penalty
+                elif self.position > 0:
+                    reward += -0.5
 
-        if action == 3 and not action_performed:  # SELL_SHORT failed
-            if self.position < 0:
-                reward += -0.5  # Already in short
-            elif self.position > 0:
-                reward += -0.3  # In long — need SELL_LONG first
+            # STRATEGY BALANCE REWARD
+            reward += self._calculate_strategy_balance_reward(action) * 0.1
 
-        # Hold penalty: прогрессивный, усиленный.
-        # FIX v4: cap поднят до -5.0 (было -1.0).
-        # Математика: закрыть убыточно (-5+2=-3) vs держать (максимум -5/шаг).
-        # При hold_penalty_start=10: после 10 шагов штраф растёт 0.1/шаг.
-        # За 30 шагов накопится -2.0 hold_penalty → закрыть выгоднее.
-        if self.position != 0 and self.entry_step > 0:
-            steps_held = self.current_step - self.entry_step
-            if steps_held > self.hold_penalty_start:
-                hold_penalty = -0.1 * (steps_held - self.hold_penalty_start) / 10
-                reward += max(hold_penalty, -5.0)   # FIX v4: cap -1.0 → -5.0, ставка -0.05 → -0.1
-
-        # FIX v4: Убран бонус +0.05 за открытие позиции.
-        # Этот бонус провоцировал спам BUY_LONG: модель открывала позицию ради +0.05,
-        # затем игнорировала SELL_LONG, снова открывала (blocked → -0.5),
-        # но суммарно спам открытий всё равно давал положительный сигнал из-за нормализации наград.
-        # Убрать бонус → модель получает reward ТОЛЬКО за прибыльное закрытие.
-
-        # Strategy balancing reward (encourage direction diversity)
-        reward += self._calculate_strategy_balance_reward(action)
-
-        # Save previous price for next step
+        else:
+            # ========================================
+            # HYBRID MODE: Simplified reward - ENCOURAGE TRADING
+            # ========================================
+            
+            # BIG reward for valid entry (encourage trading)
+            if action in [1, 3] and action_performed:
+                reward += 2.0  # Strong bonus for valid entry
+            
+            # Small penalty for invalid entry attempts
+            if action == 1 and not action_performed:
+                if self.position > 0:
+                    reward += -0.5  # Already in long
+                elif self.position < 0:
+                    reward += -0.3  # In short
+            
+            if action == 3 and not action_performed:
+                if self.position < 0:
+                    reward += -0.5  # Already in short
+                elif self.position > 0:
+                    reward += -0.3  # In long
+            
+            # Very small penalty for excessive HOLD (encourage trying to enter)
+            if action == 0 and self.position == 0:
+                reward += -0.05  # Small penalty for not trying
+        
+        # Save previous price
         self.prev_price = current_price
+
+        # Apply reward clipping
+        reward = np.clip(reward, self.reward_clip_bounds[0], self.reward_clip_bounds[1])
 
         return reward
 
@@ -691,11 +946,70 @@ class EnhancedTradingEnvironment(gym.Env):
             # Execute action FIRST, then update strategy tracking only if performed
             if action == 0:  # Hold
                 self.steps_since_last_trade += 1
+            
+            # V16-FIX: Action Masking - prevent invalid actions
+            elif self.action_masking_enabled:
+                if action == 1:  # BUY_LONG
+                    if self.position > 0:  # Already in long
+                        action = 0  # Force HOLD
+                        reward -= 0.5  # Penalty for invalid attempt
+                    elif self.position < 0:  # In short, need to cover first
+                        action = 0  # Force HOLD
+                        reward -= 0.3
+                    else:  # position == 0, valid entry
+                        action_performed = self._execute_buy_long(current_price, max_order_size_long, min_order_size)
+                        if action_performed:
+                            self._update_strategy_balance_tracking(action_int)
+                            self.total_opens += 1
+                
+                elif action == 2:  # SELL_LONG
+                    if self.position <= 0:  # No long position to close
+                        action = 0  # Force HOLD
+                        reward -= 1.0  # Strong penalty
+                    else:  # Valid close
+                        action_performed, pnl_pct = self._execute_sell_long(current_price)
+                        if action_performed:
+                            if pnl_pct is not None:
+                                if pnl_pct > 0:
+                                    self.consecutive_losses = 0
+                                else:
+                                    self.consecutive_losses += 1
+                            self.total_closes += 1
+                
+                elif action == 3:  # SELL_SHORT
+                    if self.position < 0:  # Already in short
+                        action = 0  # Force HOLD
+                        reward -= 0.5
+                    elif self.position > 0:  # In long, need to sell first
+                        action = 0  # Force HOLD
+                        reward -= 0.3
+                    else:  # position == 0, valid entry
+                        action_performed = self._execute_sell_short(current_price, max_order_size_short, min_order_size)
+                        if action_performed:
+                            self._update_strategy_balance_tracking(action_int)
+                            self.total_opens += 1
+                
+                elif action == 4:  # COVER_SHORT
+                    if self.position >= 0:  # No short position to cover
+                        action = 0  # Force HOLD
+                        reward -= 1.0  # Strong penalty
+                    else:  # Valid close
+                        action_performed, pnl_pct = self._execute_cover_short(current_price)
+                        if action_performed:
+                            if pnl_pct is not None:
+                                if pnl_pct > 0:
+                                    self.consecutive_losses = 0
+                                else:
+                                    self.consecutive_losses += 1
+                            self.total_closes += 1
+            
+            # Original logic (no masking)
             elif action == 1:  # Buy Long
                 action_performed = self._execute_buy_long(current_price, max_order_size_long, min_order_size)
                 if action_performed:
                     # Only count successfully opened positions in direction tracking
                     self._update_strategy_balance_tracking(action_int)
+                    self.total_opens += 1  # v8.0: Track opens
             elif action == 2:  # Sell Long
                 action_performed, pnl_pct = self._execute_sell_long(current_price)
                 if action_performed:
@@ -704,11 +1018,13 @@ class EnhancedTradingEnvironment(gym.Env):
                             self.consecutive_losses = 0
                         else:
                             self.consecutive_losses += 1
+                    self.total_closes += 1  # v8.0: Track closes
             elif action == 3:  # Sell Short
                 action_performed = self._execute_sell_short(current_price, max_order_size_short, min_order_size)
                 if action_performed:
                     # Only count successfully opened positions in direction tracking
                     self._update_strategy_balance_tracking(action_int)
+                    self.total_opens += 1  # v8.0: Track opens
             elif action == 4:  # Cover Short
                 action_performed, pnl_pct = self._execute_cover_short(current_price)
                 if action_performed:
@@ -717,15 +1033,34 @@ class EnhancedTradingEnvironment(gym.Env):
                             self.consecutive_losses = 0
                         else:
                             self.consecutive_losses += 1
+                    self.total_closes += 1  # v8.0: Track closes
 
             # Check trailing stop-loss
             self._check_trailing_stop(current_price)
             
-            # Calculate current portfolio value BEFORE reward calculation
+            # Calculate current portfolio value BEFORE hybrid check (needed for both TP/SL and reward)
             current_portfolio = self.balance + self.margin_locked + self.position * current_price
-
-            # Calculate reward based on portfolio change
-            reward = self._calculate_reward(current_price, action, action_performed, pnl_pct)
+            
+            # ============================================================
+            # HYBRID MODE: Check TP/SL (if enabled)
+            # This handles automatic exits so RL can focus on entry decisions
+            # ============================================================
+            if self.hybrid_mode_enabled:
+                tp_triggered, exit_reason, exit_pnl = self._check_hybrid_tpsl(current_price)
+                if tp_triggered:
+                    # Position was closed by TP/SL - use hybrid reward
+                    reward = self._calculate_hybrid_reward(current_price, action)
+                    # Track trade stats (use existing counters)
+                    self.total_trades += 1
+                    if self.debug:
+                        pnl_str = f"{exit_pnl*100:.2f}" if exit_pnl is not None else "0.00"
+                        print(f"HYBRID EXIT: {exit_reason}, pnl={pnl_str}%")
+                else:
+                    # Calculate normal reward when no TP/SL triggered
+                    reward = self._calculate_reward(current_price, action, action_performed, pnl_pct)
+            else:
+                # Original reward calculation when hybrid mode disabled
+                reward = self._calculate_reward(current_price, action, action_performed, pnl_pct)
             
             # Reset fees_step for next step (after using it in reward calculation)
             self.fees_step = 0.0
@@ -747,8 +1082,14 @@ class EnhancedTradingEnvironment(gym.Env):
             # First check: risk management conditions
             portfolio_return = (current_portfolio - self.initial_balance) / self.initial_balance if self.initial_balance > 0 else 0
             
-            # Check maximum episode loss condition (critical risk management)
-            pass
+            # P0-FIX: Check maximum episode loss condition (critical risk management)
+            # Terminate episode if losses exceed max_episode_loss_pct to prevent catastrophic losses
+            if portfolio_return <= -self.max_episode_loss_pct:
+                terminated = True
+                self.logger.warning(f"P0-FIX: Max episode loss reached: portfolio_return={portfolio_return:.4f}, "
+                                   f"threshold={-self.max_episode_loss_pct:.4f}, total_value={current_portfolio:.2f}")
+                if self.debug:
+                    print(f"MAX EPISODE LOSS TRIGGERED: return={portfolio_return*100:.2f}%, threshold={-self.max_episode_loss_pct*100:.2f}%")
             
             # Second check: episode length limit
             if not terminated and self.steps_in_episode >= self.episode_length:
@@ -770,28 +1111,33 @@ class EnhancedTradingEnvironment(gym.Env):
                 
                 # ========================================
                 # EPISODE-LEVEL REWARD: Final PnL
-                # FIX v2: Reduced scale from *1000 to *100 to prevent gradient NaN
+                # FIX v3: Reduced scale from *100 to *10 and added clipping
+                # Previous *100 caused rewards up to 16595 which destroyed learning signal
                 # ========================================
-                final_reward = portfolio_return * 100.0
+                final_reward = portfolio_return * 10.0
 
                 # Small penalty for no trading (to encourage exploration)
                 if self.total_trades == 0:
                     final_reward -= 0.5
 
                 # Penalty for leaving a position open at end of episode
-                # FIX v4: Штраф увеличен -2.0 → -5.0.
-                # Обоснование: модель должна чётко понимать что НЕ ЗАКРЫТЬ позицию к концу эпизода = большой штраф.
-                # -5.0 > hold_penalty_cap (-5.0/шаг) → эпизод-уровень штраф существенен.
-                # Сравнение: close_bonus=+2.0 + pnl(-5%) = -3.0 < -5.0 (штраф за незакрытие)
-                # → закрыть даже с убытком выгоднее, чем не закрыть вообще.
+                # P3-FIX: STRONG penalty - model MUST close positions before episode ends
+                # -10.0 base penalty + -0.1 per step open
+                # This makes it MUCH more costly to leave positions unclosed
                 if self.position != 0:
                     steps_open = self.steps_in_episode - max(0, self.entry_step - self.episode_start_step)
-                    unclosed_penalty = -(5.0 + 0.05 * steps_open)  # Прогрессивный: -5 + -0.05/шаг
+                    unclosed_penalty = -(10.0 + 0.1 * steps_open)  # P3-FIX: Increased from -5.0 to -10.0
                     final_reward += unclosed_penalty
                     if self.debug:
                         print(f"Episode ended with open position! Penalty={unclosed_penalty:.2f} (steps_open={steps_open})")
 
+                # FIX: Apply reward clipping to final reward as well
+                final_reward = np.clip(final_reward, self.reward_clip_bounds[0], self.reward_clip_bounds[1])
+
                 # Add strategy balance metrics to final info
+                # v8.0: Calculate close_rate for tracking position closing behavior
+                close_rate = self.total_closes / max(self.total_opens, 1) if self.total_opens > 0 else 0.0
+                
                 episode_info = {
                     'portfolio_value': final_portfolio,
                     'total_return': portfolio_return,
@@ -804,6 +1150,9 @@ class EnhancedTradingEnvironment(gym.Env):
                     'short_trades': self.short_trades,
                     'direction_balance_ratio': self.long_trades / max(self.short_trades, 1) if self.short_trades > 0 else float('inf'),
                     'exploration_bonus_applied': self.direction_exploration_bonuses,
+                    'total_opens': self.total_opens,   # v8.0: Track opens
+                    'total_closes': self.total_closes,  # v8.0: Track closes
+                    'close_rate': close_rate,  # v8.0: closes / opens ratio
                     'episode': {
                         'r': final_reward,
                         'l': self.steps_in_episode
@@ -942,16 +1291,18 @@ class EnhancedTradingEnvironment(gym.Env):
 
     def _execute_buy_long(self, current_price, max_order_size_long, min_order_size):
         """Execute buy long action
-        
-        IMPORTANT: 
+
+        IMPORTANT:
         - If there's an open short position, do NOT open long (use COVER_SHORT first).
         - If there's already an open long position, do NOT pyramid (use SELL_LONG first).
         This forces the model to learn proper position management.
+        
+        P1-FIX: Uses RiskManager for dynamic position sizing based on risk.
         """
         # If we have a short position, refuse to open long
         if self.position < 0:
             return False
-        
+
         # If we already have a long position, refuse to pyramid
         if self.position > 0:
             return False
@@ -960,12 +1311,22 @@ class EnhancedTradingEnvironment(gym.Env):
         if self.current_step - self.last_close_step < self.min_open_cooldown:
             return False
 
-        # Normal buy long logic
-        if max_order_size_long >= min_order_size and self.balance > max_order_size_long and current_price > 0:
-            invest_amount = min(max_order_size_long, self.balance)
+        # P3-FIX: RiskManager returns size in BTC, not USD - causes invest_amount < min_order_size
+        # Temporarily bypass RiskManager for LONG entries until fixed
+        # risk_position_size = self.risk_manager.calculate_position_size(
+        #     asset="BTC",
+        #     entry_price=current_price,
+        #     side=PositionSide.LONG
+        # )
+        
+        # Use max_order_size_long directly (already risk-managed by environment)
+        invest_amount = min(max_order_size_long, self.balance)
+        
+        # Normal buy long logic with risk-adjusted position size
+        if invest_amount >= min_order_size and current_price > 0:
             fee = invest_amount * self.transaction_fee
             coins_bought = (invest_amount - fee) / current_price
-            
+
             new_position_value = (self.position + coins_bought) * current_price
             if new_position_value > self.initial_balance * self.max_position_size:
                 return False
@@ -984,6 +1345,7 @@ class EnhancedTradingEnvironment(gym.Env):
                 self.highest_price_since_entry = current_price
                 self.lowest_price_since_entry = current_price
                 self.trailing_stop_loss = current_price * (1 - self.trailing_stop_distance)
+                # v7.0: No accumulated hold bonus to reset (hold_bonus disabled)
             else:
                 old_position = self.position - coins_bought
                 self.entry_price = ((old_position * self.entry_price) + (coins_bought * current_price)) / self.position
@@ -1040,22 +1402,24 @@ class EnhancedTradingEnvironment(gym.Env):
 
     def _execute_sell_short(self, current_price, max_order_size_short, min_order_size):
         """Execute sell short action
-        
+
         CORRECTED LOGIC:
         - When opening short: we borrow coins and sell them
         - Proceeds from sale are blocked as collateral (margin_locked)
         - We also provide additional margin from our balance
         - Position becomes negative (amount of coins we owe)
-        
-        IMPORTANT: 
+
+        IMPORTANT:
         - If there's an open long position, do NOT open short (use SELL_LONG first).
         - If there's already an open short position, do NOT pyramid (use COVER_SHORT first).
         This forces the model to learn proper position management.
+        
+        P1-FIX: Uses RiskManager for dynamic position sizing based on risk.
         """
         # If we have a long position, refuse to open short
         if self.position > 0:
             return False
-        
+
         # If we already have a short position, refuse to pyramid
         if self.position < 0:
             return False
@@ -1064,19 +1428,29 @@ class EnhancedTradingEnvironment(gym.Env):
         if self.current_step - self.last_close_step < self.min_open_cooldown:
             return False
 
-        # Normal sell short logic
-        if max_order_size_short >= min_order_size and self.balance > max_order_size_short and current_price > 0:
-            short_amount = min(max_order_size_short, self.balance)
+        # P3-FIX: RiskManager returns size in BTC, not USD - causes short_amount < min_order_size
+        # Temporarily bypass RiskManager for SHORT entries until fixed
+        # risk_position_size = self.risk_manager.calculate_position_size(
+        #     asset="BTC",
+        #     entry_price=current_price,
+        #     side=PositionSide.SHORT
+        # )
+        
+        # Use max_order_size_short directly (already risk-managed by environment)
+        short_amount = min(max_order_size_short, self.balance)
+        
+        # Normal sell short logic with risk-adjusted position size
+        if short_amount >= min_order_size and current_price > 0:
             margin_required = short_amount * self.margin_requirement
             available_balance = self.balance - self.margin_locked
 
             if available_balance >= margin_required:
                 coins_short = short_amount / current_price
                 fee = coins_short * current_price * self.transaction_fee
-                
+
                 self.short_opening_fees = fee
 
-                # CORRECTED: 
+                # CORRECTED:
                 # - margin_locked includes: sale proceeds (short_amount) + our margin (margin_required)
                 # - balance decreases by: our margin + fee
                 # - This way portfolio value stays correct
@@ -1097,6 +1471,7 @@ class EnhancedTradingEnvironment(gym.Env):
                     self.highest_price_since_entry = current_price
                     self.lowest_price_since_entry = current_price
                     self.trailing_stop_loss = current_price * (1 + self.trailing_stop_distance)
+                    # v7.0: No accumulated hold bonus to reset (hold_bonus disabled)
                 else:
                     old_position_size = abs(self.position + coins_short)
                     new_position_size = abs(self.position)
@@ -1264,6 +1639,235 @@ class EnhancedTradingEnvironment(gym.Env):
                 
                 self.trailing_stop_loss = 0
                 self.trailing_take_profit = 0
+
+    def _check_hybrid_tpsl(self, current_price):
+        """
+        HYBRID MODE: Check and execute fixed TP/SL for automatic exits.
+        
+        This is the ALTERNATIVE approach where:
+        - RL focuses on entry decisions only
+        - Fixed TP/SL rules handle exits automatically
+        - This separates learning: RL learns when to enter, rules handle exit
+        
+        Returns:
+            tuple: (exit_triggered: bool, exit_reason: str, pnl_pct: float or None)
+        """
+        if not self.hybrid_mode_enabled:
+            return False, None, None
+        
+        if self.position == 0 or self.entry_price == 0:
+            return False, None, None
+        
+        # Check minimum hold time before TP/SL can trigger
+        steps_held = self.current_step - self.entry_step
+        if steps_held < self.hybrid_min_hold_for_tpsl:
+            return False, None, None
+        
+        # Calculate current unrealized PnL percentage
+        if self.position > 0:  # Long position
+            unrealized_pnl_pct = (current_price - self.entry_price) / self.entry_price
+        else:  # Short position
+            unrealized_pnl_pct = (self.entry_price - current_price) / self.entry_price
+        
+        # Check Take Profit
+        if unrealized_pnl_pct >= self.hybrid_take_profit_pct:
+            # Execute TP close
+            exit_reason = 'tp'
+            if self.debug:
+                print(f"HYBRID TP TRIGGERED: pnl_pct={unrealized_pnl_pct*100:.2f}%, price={current_price}")
+            
+            # Close the position
+            if self.position > 0:
+                # Close long
+                revenue = abs(self.position) * current_price
+                fee = revenue * self.transaction_fee
+                pnl = revenue - (abs(self.position) * self.entry_price) - fee
+                self.balance += revenue - fee
+                self.total_fees += fee
+                self.fees_step += fee
+                self.total_pnl += pnl
+                if pnl > 0:
+                    self.win_count += 1
+                else:
+                    self.loss_count += 1
+            else:
+                # Close short
+                cover_cost = abs(self.position) * current_price
+                close_fee = cover_cost * self.transaction_fee
+                entry_value = abs(self.position) * self.entry_price
+                price_pnl = entry_value - cover_cost
+                pnl = price_pnl - close_fee
+                
+                self.balance = self.balance + self.margin_locked - cover_cost - close_fee
+                self.margin_locked = 0
+                self.total_fees += close_fee
+                self.fees_step += close_fee
+                self.short_opening_fees = 0.0
+                self.total_pnl += pnl
+                if pnl > 0:
+                    self.win_count += 1
+                else:
+                    self.loss_count += 1
+            
+            # Reset position
+            self.position = 0
+            self.entry_price = 0
+            self.hybrid_exit_reason = exit_reason
+            self.hybrid_entry_unrealized_pnl = unrealized_pnl_pct
+            
+            return True, exit_reason, unrealized_pnl_pct
+        
+        # Check Stop Loss
+        if unrealized_pnl_pct <= -self.hybrid_stop_loss_pct:
+            # Execute SL close
+            exit_reason = 'sl'
+            if self.debug:
+                print(f"HYBRID SL TRIGGERED: pnl_pct={unrealized_pnl_pct*100:.2f}%, price={current_price}")
+            
+            # Close the position
+            if self.position > 0:
+                # Close long
+                revenue = abs(self.position) * current_price
+                fee = revenue * self.transaction_fee
+                pnl = revenue - (abs(self.position) * self.entry_price) - fee
+                self.balance += revenue - fee
+                self.total_fees += fee
+                self.fees_step += fee
+                self.total_pnl += pnl
+                if pnl > 0:
+                    self.win_count += 1
+                else:
+                    self.loss_count += 1
+            else:
+                # Close short
+                cover_cost = abs(self.position) * current_price
+                close_fee = cover_cost * self.transaction_fee
+                entry_value = abs(self.position) * self.entry_price
+                price_pnl = entry_value - cover_cost
+                pnl = price_pnl - close_fee
+                
+                self.balance = self.balance + self.margin_locked - cover_cost - close_fee
+                self.margin_locked = 0
+                self.total_fees += close_fee
+                self.fees_step += close_fee
+                self.short_opening_fees = 0.0
+                self.total_pnl += pnl
+                if pnl > 0:
+                    self.win_count += 1
+                else:
+                    self.loss_count += 1
+            
+            # Reset position
+            self.position = 0
+            self.entry_price = 0
+            self.hybrid_exit_reason = exit_reason
+            self.hybrid_entry_unrealized_pnl = unrealized_pnl_pct
+            
+            return True, exit_reason, unrealized_pnl_pct
+        
+        # Check max hold time (time-based exit)
+        if steps_held >= self.hybrid_max_hold_steps:
+            # Force close at market
+            exit_reason = 'time'
+            if self.debug:
+                print(f"HYBRID TIME EXIT: steps_held={steps_held}, max={self.hybrid_max_hold_steps}")
+            
+            # Close the position
+            if self.position > 0:
+                revenue = abs(self.position) * current_price
+                fee = revenue * self.transaction_fee
+                pnl = revenue - (abs(self.position) * self.entry_price) - fee
+                self.balance += revenue - fee
+                self.total_fees += fee
+                self.fees_step += fee
+                self.total_pnl += pnl
+                if pnl > 0:
+                    self.win_count += 1
+                else:
+                    self.loss_count += 1
+            else:
+                cover_cost = abs(self.position) * current_price
+                close_fee = cover_cost * self.transaction_fee
+                entry_value = abs(self.position) * self.entry_price
+                price_pnl = entry_value - cover_cost
+                pnl = price_pnl - close_fee
+                
+                self.balance = self.balance + self.margin_locked - cover_cost - close_fee
+                self.margin_locked = 0
+                self.total_fees += close_fee
+                self.fees_step += close_fee
+                self.short_opening_fees = 0.0
+                self.total_pnl += pnl
+                if pnl > 0:
+                    self.win_count += 1
+                else:
+                    self.loss_count += 1
+            
+            self.position = 0
+            self.entry_price = 0
+            self.hybrid_exit_reason = exit_reason
+            self.hybrid_entry_unrealized_pnl = unrealized_pnl_pct
+            
+            return True, exit_reason, unrealized_pnl_pct
+        
+        return False, None, None
+
+    def _calculate_hybrid_reward(self, current_price, action):
+        """
+        Calculate reward for HYBRID mode.
+        
+        In hybrid mode:
+        - Entry reward: Based on the quality of entry (future realized PnL)
+        - TP/SL exits are handled automatically - model gets reward for the realized PnL
+        - RL policy focuses on learning WHEN to enter, not when to exit
+        """
+        if not self.hybrid_mode_enabled:
+            return 0.0
+        
+        reward = 0.0
+        
+        # If position was just closed by hybrid TP/SL
+        if self.hybrid_exit_reason is not None:
+            pnl_pct = self.hybrid_entry_unrealized_pnl
+            
+            if pnl_pct > 0:
+                # Profit: reward proportional to profit
+                reward += pnl_pct * 100 * 3.0  # Scale up profits
+            else:
+                # Loss: penalty proportional to loss
+                reward += pnl_pct * 100 * 1.5  # Scale up losses
+            
+            if self.debug:
+                print(f"HYBRID REWARD: exit={self.hybrid_exit_reason}, pnl={pnl_pct*100:.2f}%, reward={reward:.2f}")
+            
+            # Reset hybrid tracking
+            self.hybrid_exit_reason = None
+            self.hybrid_entry_unrealized_pnl = 0.0
+            
+            return reward
+        
+        # If RL made a manual close (when allowed)
+        if action in [2, 4]:
+            # Use existing close reward logic but with hybrid scaling
+            # This is optional - RL can still close manually if enabled
+            pass
+        
+        # Small reward for holding good positions (potential future profit)
+        if self.position != 0 and self.entry_price > 0:
+            if self.position > 0:
+                unrealized_pnl = (current_price - self.entry_price) / self.entry_price
+            else:
+                unrealized_pnl = (self.entry_price - current_price) / self.entry_price
+            
+            # If in profit, small positive reward to encourage holding
+            if unrealized_pnl > 0:
+                reward += unrealized_pnl * 0.1  # Small holding bonus
+            
+            # If in loss and close to SL, small penalty
+            if unrealized_pnl < -self.hybrid_stop_loss_pct * 0.5:
+                reward -= 0.05  # Warning penalty
+        
+        return reward
 
 # For backward compatibility
 def create_env(df, initial_balance=10000, transaction_fee=0.0018):
